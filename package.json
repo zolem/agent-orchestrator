@@ -1,13 +1,22 @@
 {
-  "name": "memory-search",
+  "name": "cursor-orchestrator",
   "version": "1.0.0",
-  "description": "Hybrid vector + BM25 memory search for the Cursor orchestrator command",
+  "description": "Orchestrator command + memory search system for Cursor IDE",
   "type": "module",
   "bin": {
     "memory-search": "./bin/memory-search.js"
   },
+  "files": [
+    "dist/",
+    "bin/",
+    "commands/",
+    "agents/",
+    "postinstall.js"
+  ],
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --minify --outfile=dist/cli.js --packages=external",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node postinstall.js",
     "start": "node bin/memory-search.js"
   },
   "dependencies": {
@@ -18,6 +27,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
+    "esbuild": "^0.27.3",
     "typescript": "^5.7.0"
   },
   "engines": {
