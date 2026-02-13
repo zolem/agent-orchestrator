@@ -62,6 +62,16 @@ When a session observation contradicts an existing memory entry:
 - **Patterns/Lessons**: Keep both if they apply to different contexts, otherwise newer wins
 - **Anti-Patterns**: Only remove if there's clear evidence the anti-pattern no longer applies
 
+## Post-Write: Refresh Search Index
+
+After updating MEMORY.md, run the search index refresh so new memories are immediately searchable:
+
+```bash
+memory-search index
+```
+
+This updates the vector + keyword search index at `~/.cursor/memory/.search-index.sqlite`. If the command is not available (not installed), skip this step silently — the orchestrator can still read MEMORY.md directly.
+
 ## Output
 
 After updating MEMORY.md, report back with a brief summary:
@@ -69,3 +79,4 @@ After updating MEMORY.md, report back with a brief summary:
 - Number of entries updated (upserted)
 - Number of entries pruned
 - Current line count of MEMORY.md
+- Whether the search index was refreshed

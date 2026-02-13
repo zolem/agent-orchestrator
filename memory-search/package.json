@@ -1,0 +1,26 @@
+{
+  "name": "memory-search",
+  "version": "1.0.0",
+  "description": "Hybrid vector + BM25 memory search for the Cursor orchestrator command",
+  "type": "module",
+  "bin": {
+    "memory-search": "./bin/memory-search.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node bin/memory-search.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "commander": "^13.0.0",
+    "node-llama-cpp": "^3.0.0",
+    "sqlite-vec": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
