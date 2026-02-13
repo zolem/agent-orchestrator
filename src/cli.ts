@@ -2,8 +2,10 @@
  * cli.ts — CLI entry point for memory-search.
  *
  * Commands:
- *   memory-search index   — Index/re-index memory files
- *   memory-search query   — Hybrid search over indexed memories
+ *   memory-search index     — Index/re-index memory files
+ *   memory-search query     — Hybrid search over indexed memories
+ *   memory-search status    — Show index statistics
+ *   memory-search uninstall — Remove all installed files and optionally delete data
  */
 
 import { Command } from "commander";
@@ -12,6 +14,10 @@ import { createEmbeddingProvider } from "./embeddings.js";
 import { indexMemoryFiles } from "./indexer.js";
 import { hybridSearch } from "./search.js";
 import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import readline from "node:readline";
+import { execSync } from "node:child_process";
 
 const program = new Command();
 
@@ -167,6 +173,124 @@ program
     } finally {
       closeDatabase(state);
     }
+  });
+
+// ---------------------------------------------------------------------------
+// uninstall command
+// ---------------------------------------------------------------------------
+
+program
+  .command("uninstall")
+  .description("Remove all installed orchestrator files and uninstall the package")
+  .action(async () => {
+    const home = os.homedir();
+    const cursorDir = path.join(home, ".cursor");
+    const memoryDir = path.join(cursorDir, "memory");
+
+    // Files the postinstall created
+    const installedFiles = [
+      path.join(cursorDir, "commands", "orchestrator.md"),
+      path.join(cursorDir, "agents", "memory-agent.md"),
+      path.join(cursorDir, "agents", "memory-recall-agent.md"),
+    ];
+
+    // Directories the postinstall created (only removed if empty)
+    const installedDirs = [
+      path.join(cursorDir, "agents", "dynamic"),
+    ];
+
+    console.log("This will remove:\n");
+
+    for (const file of installedFiles) {
+      if (fs.existsSync(file)) {
+        console.log(`  ${file}`);
+      }
+    }
+    for (const dir of installedDirs) {
+      if (fs.existsSync(dir)) {
+        console.log(`  ${dir}/ (if empty)`);
+      }
+    }
+
+    console.log("");
+
+    // Ask about memory data
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    const ask = (question: string): Promise<string> =>
+      new Promise((resolve) => rl.question(question, resolve));
+
+    const dataAnswer = await ask(
+      `Do you want to delete your memory data at ${memoryDir}?\n` +
+      "  This includes MEMORY.md, session logs, the search index, and the\n" +
+      "  downloaded embedding model (~0.6GB).\n\n" +
+      "  [k]eep data for later  /  [d]elete everything: ",
+    );
+
+    const deleteData = dataAnswer.trim().toLowerCase().startsWith("d");
+
+    rl.close();
+    console.log("");
+
+    // Remove installed files
+    for (const file of installedFiles) {
+      try {
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+          console.log(`  Removed: ${file}`);
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`  Warning: could not remove ${file}: ${msg}`);
+      }
+    }
+
+    // Remove empty directories
+    for (const dir of installedDirs) {
+      try {
+        if (fs.existsSync(dir)) {
+          const entries = fs.readdirSync(dir);
+          if (entries.length === 0) {
+            fs.rmdirSync(dir);
+            console.log(`  Removed: ${dir}/`);
+          } else {
+            console.log(`  Skipped: ${dir}/ (not empty)`);
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`  Warning: could not remove ${dir}: ${msg}`);
+      }
+    }
+
+    // Optionally delete memory data
+    if (deleteData) {
+      try {
+        fs.rmSync(memoryDir, { recursive: true, force: true });
+        console.log(`  Removed: ${memoryDir}/`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`  Warning: could not remove ${memoryDir}: ${msg}`);
+      }
+    } else {
+      console.log(`  Kept:    ${memoryDir}/`);
+    }
+
+    // Uninstall the npm package
+    console.log("\nUninstalling cursor-orchestrator...\n");
+    try {
+      execSync("npm uninstall -g cursor-orchestrator", { stdio: "inherit" });
+    } catch {
+      console.warn(
+        "\n  Warning: could not run 'npm uninstall -g cursor-orchestrator'." +
+        "\n  Run it manually to finish cleanup.\n",
+      );
+    }
+
+    console.log("\nUninstall complete.");
   });
 
 // ---------------------------------------------------------------------------
