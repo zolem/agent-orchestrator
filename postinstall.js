@@ -49,7 +49,7 @@ function copyFile(src, dest) {
 // Main
 // ---------------------------------------------------------------------------
 
-console.log("Setting up cursor-orchestrator...\n");
+console.log("Setting up agent-orchestrator...\n");
 
 // Create directories
 ensureDir(COMMANDS_DIR);

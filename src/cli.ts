@@ -282,10 +282,10 @@ program
     // Uninstall the npm package
     console.log("\nUninstalling cursor-orchestrator...\n");
     try {
-      execSync("npm uninstall -g cursor-orchestrator", { stdio: "inherit" });
+      execSync("npm uninstall -g agent-orchestrator", { stdio: "inherit" });
     } catch {
       console.warn(
-        "\n  Warning: could not run 'npm uninstall -g cursor-orchestrator'." +
+        "\n  Warning: could not run 'npm uninstall -g agent-orchestrator'." +
         "\n  Run it manually to finish cleanup.\n",
       );
     }

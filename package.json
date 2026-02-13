@@ -1,5 +1,5 @@
 {
-  "name": "cursor-orchestrator",
+  "name": "agent-orchestrator",
   "version": "1.0.0",
   "description": "Orchestrator command + memory search system for Cursor IDE",
   "type": "module",
