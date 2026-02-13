@@ -5,15 +5,17 @@
  *   - ~/.cursor/commands/orchestrator.md
  *   - ~/.cursor/agents/memory-agent.md
  *   - ~/.cursor/agents/memory-recall-agent.md
- *   - ~/.cursor/agents/orchestrator.md
  *   - ~/.cursor/agents/dynamic/           (empty, for runtime agents)
  *   - ~/.cursor/memory/                   (with initial MEMORY.md if missing)
  *   - ~/.cursor/memory/sessions/
+ *   6. Runs `memory-search index` to download the embedding model (~0.6GB)
+ *      and build the initial search index.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,6 +96,26 @@ if (!fs.existsSync(memoryFile)) {
     "utf-8",
   );
   console.log(`  Created:   ${memoryFile}`);
+}
+
+// ---------------------------------------------------------------------------
+// Build initial search index (downloads embedding model on first run)
+// ---------------------------------------------------------------------------
+
+const MEMORY_SEARCH_BIN = path.join(__dirname, "bin", "memory-search.js");
+
+console.log("\nBuilding initial search index...");
+console.log("(This will download the embedding model on first run — ~0.6GB)\n");
+
+try {
+  execFileSync(process.execPath, [MEMORY_SEARCH_BIN, "index", "--verbose"], {
+    stdio: "inherit",
+  });
+} catch {
+  console.warn(
+    "\n  Warning: Initial indexing failed. This is OK — you can run" +
+    "\n  'memory-search index' manually later.\n",
+  );
 }
 
 console.log(`
