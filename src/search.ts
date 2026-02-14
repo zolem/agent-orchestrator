@@ -311,6 +311,24 @@ function mergeHybridResults(
 // Main search function
 // ---------------------------------------------------------------------------
 
+/**
+ * Performs hybrid search by combining vector similarity and BM25 keyword search.
+ *
+ * Implements weighted score fusion: fetches 4× the requested results as candidates
+ * from each method (vector via extension or JS fallback, keyword via FTS), merges
+ * by chunk ID with weighted scores (70% vector, 30% BM25), then returns the top
+ * results. If queryVec is empty, only keyword search runs; if FTS is unavailable,
+ * only vector search runs.
+ *
+ * @param state - Database state (db, vecAvailable, vecDimensions, ftsAvailable)
+ * @param queryVec - Embedding vector for semantic search (empty array skips vector search)
+ * @param queryText - Raw query string for BM25 keyword search
+ * @param options - Optional config; maxResults defaults to 20
+ * @returns Sorted array of SearchResult (filePath, lineStart, lineEnd, snippet, score, model)
+ *
+ * @example
+ * const results = await hybridSearch(state, embedding, "foo bar", { maxResults: 10 });
+ */
 export async function hybridSearch(
   state: DbState,
   queryVec: number[],
