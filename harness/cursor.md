@@ -12,22 +12,30 @@
 
 ## Sub-Agent Invocation Syntax (Cursor)
 
-To invoke a sub-agent, use the Task tool:
+### Built-in Agent Types
+
+For built-in agent types, use the Task tool directly:
 
 ```
 Task({
-  subagent_type: "<agent-name>",
+  subagent_type: "<built-in-type>",
   prompt: "<task description>",
   description: "<short 3-5 word description>"
 })
 ```
 
+Built-in types: `explore`, `generalPurpose`, `shell`, `browser-use`
+
+### Custom Agents (memory-recall-agent, memory-agent, dynamic agents)
+
+Custom agents defined at `~/.cursor/agents/` must be invoked via `generalPurpose` with explicit instructions from the agent file. This is because the Task tool only accepts built-in subagent_types.
+
 ### Example: Invoking the memory-recall-agent
 
 ```
 Task({
-  subagent_type: "memory-recall-agent",
-  prompt: "The user's request: <paste or summarize the user's request here>. Project: <project name if known>.",
+  subagent_type: "generalPurpose",
+  prompt: "You are the memory recall agent. Your job is to read memory and search past sessions, then return a unified briefing.\n\n1. Read ~/.config/agent-orchestrator/memory/MEMORY.md in full\n2. Run `memory-search query \"<user's task description>\" --json -n 10` via shell\n3. For the top 3-5 results (score > 0.25), read the source files at ~/.config/agent-orchestrator/memory/<path>\n4. Return a briefing with: User Preferences, Sub-Agent Patterns, Relevant Past Sessions, Key Lessons, Pitfalls to Avoid, Suggested Approach\n\nThe user's request: <paste or summarize the user's request here>. Project: <project name if known>.",
   description: "Recall relevant memories"
 })
 ```
@@ -36,22 +44,20 @@ Task({
 
 ```
 Task({
-  subagent_type: "memory-agent",
-  prompt: "Update ~/.config/agent-orchestrator/memory/MEMORY.md based on the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md",
+  subagent_type: "generalPurpose",
+  prompt: "You are the memory curator agent. Your job is to distill a session log into MEMORY.md.\n\n1. Read the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md\n2. Read the current ~/.config/agent-orchestrator/memory/MEMORY.md\n3. Extract new preferences, patterns, lessons, and anti-patterns from the session\n4. Update MEMORY.md with the new information (merge, don't replace)\n5. Keep MEMORY.md concise — distill, don't copy verbatim",
   description: "Curate session into memory"
 })
 ```
 
 ### Example: Creating and invoking a dynamic agent
 
-First, write the agent file to `~/.cursor/agents/dynamic/research-agent.md`:
+First, write the agent file to `~/.cursor/agents/dynamic/research-agent.md` for reference:
 
 ```markdown
 ---
 name: research-agent
-model: claude-4.5-haiku
 description: Explores codebase structure, finds relevant files, and summarizes patterns.
-readonly: true
 ---
 
 You are a research agent. Explore the codebase and report back with:
@@ -60,12 +66,12 @@ You are a research agent. Explore the codebase and report back with:
 3. Dependencies and relationships
 ```
 
-Then invoke it:
+Then invoke it via generalPurpose (or use `explore` for read-only research):
 
 ```
 Task({
-  subagent_type: "research-agent",
-  prompt: "Research the authentication flow in this codebase...",
+  subagent_type: "explore",
+  prompt: "Research the authentication flow in this codebase. Report back with: 1) Relevant files and their purposes 2) Existing patterns 3) Dependencies",
   description: "Research auth flow"
 })
 ```
@@ -102,15 +108,23 @@ Use the cheapest model that can handle the task. For the full list of available 
 
 ## Built-in Agent Types (Cursor)
 
-These agent types are available without creating a dynamic agent file:
+These agent types can be used directly with the Task tool's `subagent_type` parameter:
 
 | Agent Type | Description |
 |:-----------|:------------|
-| `explore` | Fast agent for codebase exploration. Use for quick file searches and pattern discovery. |
-| `generalPurpose` | General-purpose agent for complex multi-step tasks. |
+| `explore` | Fast, read-only agent for codebase exploration. Use for quick file searches and pattern discovery. |
+| `generalPurpose` | General-purpose agent for complex multi-step tasks. Can read, write, and execute commands. |
 | `shell` | Command execution specialist for running bash commands. |
-| `memory-recall-agent` | Reads MEMORY.md and searches past sessions at session start. |
-| `memory-agent` | Curates session logs into MEMORY.md at session end. |
+| `browser-use` | Browser automation for testing web applications. |
+
+## Custom Agents (Cursor)
+
+The memory agents are installed at `~/.cursor/agents/` for reference, but must be invoked via `generalPurpose` with explicit prompts (see examples above):
+
+| Agent File | Purpose |
+|:-----------|:--------|
+| `memory-recall-agent.md` | Reference prompt for memory recall at session start |
+| `memory-agent.md` | Reference prompt for curating sessions into MEMORY.md |
 
 ## Example: Full Team Setup (Cursor)
 

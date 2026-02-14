@@ -40,13 +40,15 @@ function walkDir(dir: string, files: string[]): void {
 export function listMemoryFiles(memoryDir: string): string[] {
   const result: string[] = [];
 
-  // MEMORY.md at root
+  // MEMORY.md at root (check both casings, but only add one)
   const memoryFile = path.join(memoryDir, "MEMORY.md");
-  if (fs.existsSync(memoryFile)) result.push(memoryFile);
-
-  // memory.md (alternative casing)
   const altMemoryFile = path.join(memoryDir, "memory.md");
-  if (fs.existsSync(altMemoryFile) && altMemoryFile !== memoryFile) {
+  
+  if (fs.existsSync(memoryFile)) {
+    result.push(memoryFile);
+  } else if (fs.existsSync(altMemoryFile)) {
+    // Only add lowercase version if uppercase doesn't exist
+    // This handles case-sensitive filesystems where both might exist separately
     result.push(altMemoryFile);
   }
 
@@ -54,10 +56,10 @@ export function listMemoryFiles(memoryDir: string): string[] {
   const sessionsDir = path.join(memoryDir, "sessions");
   walkDir(sessionsDir, result);
 
-  // Deduplicate by resolved path
+  // Deduplicate by lowercase resolved path (handles case-insensitive filesystems)
   const seen = new Set<string>();
   return result.filter((f) => {
-    const resolved = fs.realpathSync(f);
+    const resolved = fs.realpathSync(f).toLowerCase();
     if (seen.has(resolved)) return false;
     seen.add(resolved);
     return true;

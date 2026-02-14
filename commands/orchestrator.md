@@ -277,7 +277,7 @@ These are just examples, you must decide what kind of team best fits the project
 
 Before doing anything else, load your memory and review existing resources:
 
-1. **Invoke the memory-recall-agent**: This is your **only** memory step. Do not read MEMORY.md directly — the recall agent handles everything. See the harness-specific invocation syntax below.
+1. **Invoke the memory-recall-agent**: This is your **only** memory step. Do not read MEMORY.md directly — the recall agent handles everything. See the **Harness-Specific Configuration** section at the end of this document for the exact invocation syntax on your platform.
 2. **Review existing agents**: List files in the dynamic agents directory to see what sub-agents exist from prior sessions
 3. **Decide reuse vs create**:
    - Reuse agents that match needed roles and have proven effective
