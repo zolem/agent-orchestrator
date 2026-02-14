@@ -2,6 +2,7 @@
   "name": "agent-orchestrator",
   "version": "1.0.0",
   "description": "Orchestrator command + memory search system for Cursor and Claude Code",
+  "license": "GPL-3.0-only",
   "type": "module",
   "bin": {
     "memory-search": "./bin/memory-search.js"
