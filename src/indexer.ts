@@ -197,6 +197,19 @@ export async function indexMemoryFiles(
       )
     : null;
 
+  // Helper to delete stale vec entries for a given path (must collect chunk IDs first)
+  function deleteVecByPath(filePath: string): void {
+    if (!state.vecAvailable) return;
+    const ids = state.db
+      .prepare(`SELECT id FROM chunks WHERE path = ?`)
+      .all(filePath) as Array<{ id: string }>;
+    if (ids.length === 0) return;
+    const deleteVec = state.db.prepare(`DELETE FROM chunks_vec WHERE id = ?`);
+    for (const row of ids) {
+      deleteVec.run(row.id);
+    }
+  }
+
   // Track all current file paths to detect deletions
   const currentPaths = new Set<string>();
 
@@ -217,7 +230,8 @@ export async function indexMemoryFiles(
     // Update file record
     upsertFile.run(entry.relPath, entry.hash, Math.floor(entry.mtimeMs), entry.size);
 
-    // Remove old chunks for this file
+    // Remove old chunks for this file (vec first, since it needs chunk IDs from chunks table)
+    deleteVecByPath(entry.relPath);
     deleteChunksByPath.run(entry.relPath);
     deleteFtsByPath?.run(entry.relPath);
 
@@ -246,7 +260,12 @@ export async function indexMemoryFiles(
       ensureVectorTable(state, firstEmbedding.length);
     }
 
-    // Prepare vec insert lazily (after table exists)
+    // Prepare vec statements lazily (after table exists)
+    // Note: vec0 virtual tables don't support INSERT OR REPLACE, so we must
+    // delete-then-insert. We also clean up any orphaned vec entries here.
+    const deleteVecById = state.vecAvailable && state.vecDimensions
+      ? state.db.prepare(`DELETE FROM chunks_vec WHERE id = ?`)
+      : null;
     const insertVec = state.vecAvailable && state.vecDimensions
       ? state.db.prepare(`INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)`)
       : null;
@@ -281,7 +300,8 @@ export async function indexMemoryFiles(
           chunk.endLine,
         );
 
-        // Vector insert
+        // Vector insert (delete first to handle orphaned entries from prior runs)
+        deleteVecById?.run(id);
         insertVec?.run(id, vectorToBlob(embedding));
       }
 
@@ -298,12 +318,12 @@ export async function indexMemoryFiles(
   for (const row of allDbFiles) {
     if (!currentPaths.has(row.path)) {
       if (verbose) console.log(`  Removing stale: ${row.path}`);
+      deleteVecByPath(row.path);
       state.db.prepare(`DELETE FROM files WHERE path = ?`).run(row.path);
       state.db.prepare(`DELETE FROM chunks WHERE path = ?`).run(row.path);
       if (state.ftsAvailable) {
         state.db.prepare(`DELETE FROM chunks_fts WHERE path = ?`).run(row.path);
       }
-      // Vec cleanup would require listing chunk IDs first; skip for simplicity
     }
   }
 
