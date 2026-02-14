@@ -1,17 +1,16 @@
 /**
- * search.ts — Hybrid BM25 + vector search with weighted score fusion.
+ * search.ts — Hybrid vector + FTS search using CozoDB Datalog queries.
  *
- * Implements OpenClaw's exact hybrid search algorithm from hybrid.ts:
- * - buildFtsQuery(): tokenize, quote, AND-join
- * - bm25RankToScore(): 1 / (1 + max(0, rank))
- * - mergeHybridResults(): union by chunk ID, weighted score fusion
- * - 4x candidateMultiplier
- * - ~700 char snippet truncation
+ * Performs hybrid search by combining:
+ * - HNSW cosine-distance vector search (via CozoDB's built-in index)
+ * - Full-text search with TF-IDF scoring (via CozoDB's built-in FTS)
+ *
+ * Results are merged with weighted score fusion (70% vector, 30% FTS)
+ * inside a single Datalog query, then returned as ranked SearchResult[].
  */
 
-import type Database from "better-sqlite3";
 import type { DbState } from "./db.js";
-import { cosineSimilarity } from "./embeddings.js";
+import { runQuery } from "./db.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -37,30 +36,6 @@ export interface SearchResult {
 }
 
 // ---------------------------------------------------------------------------
-// FTS query building (matches OpenClaw's buildFtsQuery)
-// ---------------------------------------------------------------------------
-
-export function buildFtsQuery(raw: string): string | null {
-  const tokens =
-    raw
-      .match(/[A-Za-z0-9_]+/g)
-      ?.map((t) => t.trim())
-      .filter(Boolean) ?? [];
-  if (tokens.length === 0) return null;
-  const quoted = tokens.map((t) => `"${t.replace(/"/g, "")}"`);
-  return quoted.join(" AND ");
-}
-
-// ---------------------------------------------------------------------------
-// BM25 rank to score (matches OpenClaw's bm25RankToScore)
-// ---------------------------------------------------------------------------
-
-export function bm25RankToScore(rank: number): number {
-  const normalized = Number.isFinite(rank) ? Math.max(0, rank) : 999;
-  return 1 / (1 + normalized);
-}
-
-// ---------------------------------------------------------------------------
 // Snippet truncation (UTF-16 safe)
 // ---------------------------------------------------------------------------
 
@@ -75,256 +50,128 @@ function truncateSnippet(text: string, maxChars: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Vector to Buffer for sqlite-vec queries
+// CozoDB Datalog query templates
 // ---------------------------------------------------------------------------
 
-function vectorToBlob(embedding: number[]): Buffer {
-  return Buffer.from(new Float32Array(embedding).buffer);
-}
+/**
+ * Full hybrid query: HNSW vector search + FTS, merged with weighted fusion.
+ *
+ * Produces rows: [path, start_line, end_line, score, content, source]
+ */
+const HYBRID_QUERY = `
+vec[id, vs] :=
+  ~chunks:hnsw_embedding{ id |
+    query: vec($query_vec),
+    k: $candidate_limit,
+    ef: 100,
+    bind_distance: dist
+  },
+  vs = 1.0 - dist
 
-// ---------------------------------------------------------------------------
-// Vector search (sqlite-vec or JS fallback)
-// ---------------------------------------------------------------------------
-
-interface VectorResult {
-  id: string;
-  path: string;
-  startLine: number;
-  endLine: number;
-  source: string;
-  snippet: string;
-  vectorScore: number;
-}
-
-function searchVectorViaExtension(
-  db: Database.Database,
-  queryVec: number[],
-  model: string,
-  limit: number,
-): VectorResult[] {
-  const rows = db
-    .prepare(
-      `SELECT c.id, c.path, c.start_line, c.end_line, c.text,
-              c.source,
-              vec_distance_cosine(v.embedding, ?) AS dist
-       FROM chunks_vec v
-       JOIN chunks c ON c.id = v.id
-       WHERE c.model = ?
-       ORDER BY dist ASC
-       LIMIT ?`,
-    )
-    .all(vectorToBlob(queryVec), model, limit) as Array<{
-    id: string;
-    path: string;
-    start_line: number;
-    end_line: number;
-    text: string;
-    source: string;
-    dist: number;
-  }>;
-
-  return rows.map((row) => ({
-    id: row.id,
-    path: row.path,
-    startLine: row.start_line,
-    endLine: row.end_line,
-    source: row.source,
-    snippet: truncateSnippet(row.text, MAX_SNIPPET_CHARS),
-    vectorScore: 1 - row.dist,
-  }));
-}
-
-function searchVectorViaJs(
-  db: Database.Database,
-  queryVec: number[],
-  model: string,
-  limit: number,
-): VectorResult[] {
-  // Load all chunks and compute cosine similarity in JS
-  const rows = db
-    .prepare(
-      `SELECT id, path, start_line, end_line, text, embedding, source
-       FROM chunks
-       WHERE model = ?`,
-    )
-    .all(model) as Array<{
-    id: string;
-    path: string;
-    start_line: number;
-    end_line: number;
-    text: string;
-    embedding: string;
-    source: string;
-  }>;
-
-  const scored = rows
-    .map((row) => {
-      let embedding: number[];
-      try {
-        embedding = JSON.parse(row.embedding) as number[];
-      } catch {
-        return null;
-      }
-      const score = cosineSimilarity(queryVec, embedding);
-      return {
-        id: row.id,
-        path: row.path,
-        startLine: row.start_line,
-        endLine: row.end_line,
-        source: row.source,
-        snippet: truncateSnippet(row.text, MAX_SNIPPET_CHARS),
-        vectorScore: score,
-      };
-    })
-    .filter((r): r is VectorResult => r !== null && Number.isFinite(r.vectorScore));
-
-  return scored
-    .sort((a, b) => b.vectorScore - a.vectorScore)
-    .slice(0, limit);
-}
-
-// ---------------------------------------------------------------------------
-// Keyword search (FTS5 BM25)
-// ---------------------------------------------------------------------------
-
-interface KeywordResult {
-  id: string;
-  path: string;
-  startLine: number;
-  endLine: number;
-  source: string;
-  snippet: string;
-  textScore: number;
-}
-
-function searchKeyword(
-  db: Database.Database,
-  query: string,
-  model: string,
-  limit: number,
-): KeywordResult[] {
-  const ftsQuery = buildFtsQuery(query);
-  if (!ftsQuery) return [];
-
-  const rows = db
-    .prepare(
-      `SELECT id, path, source, start_line, end_line, text,
-              bm25(chunks_fts) AS rank
-       FROM chunks_fts
-       WHERE chunks_fts MATCH ? AND model = ?
-       ORDER BY rank ASC
-       LIMIT ?`,
-    )
-    .all(ftsQuery, model, limit) as Array<{
-    id: string;
-    path: string;
-    source: string;
-    start_line: number;
-    end_line: number;
-    text: string;
-    rank: number;
-  }>;
-
-  return rows.map((row) => ({
-    id: row.id,
-    path: row.path,
-    startLine: row.start_line,
-    endLine: row.end_line,
-    source: row.source,
-    snippet: truncateSnippet(row.text, MAX_SNIPPET_CHARS),
-    textScore: bm25RankToScore(row.rank),
-  }));
-}
-
-// ---------------------------------------------------------------------------
-// Hybrid merge (matches OpenClaw's mergeHybridResults)
-// ---------------------------------------------------------------------------
-
-function mergeHybridResults(
-  vector: VectorResult[],
-  keyword: KeywordResult[],
-  vectorWeight: number,
-  textWeight: number,
-): SearchResult[] {
-  const byId = new Map<
-    string,
-    {
-      id: string;
-      path: string;
-      startLine: number;
-      endLine: number;
-      source: string;
-      snippet: string;
-      vectorScore: number;
-      textScore: number;
-    }
-  >();
-
-  for (const r of vector) {
-    byId.set(r.id, {
-      id: r.id,
-      path: r.path,
-      startLine: r.startLine,
-      endLine: r.endLine,
-      source: r.source,
-      snippet: r.snippet,
-      vectorScore: r.vectorScore,
-      textScore: 0,
-    });
+fts[id, fs] :=
+  ~chunks:fts_content{ id |
+    query: $query_text,
+    k: $candidate_limit,
+    score_kind: 'tf_idf',
+    bind_score: fs
   }
 
-  for (const r of keyword) {
-    const existing = byId.get(r.id);
-    if (existing) {
-      existing.textScore = r.textScore;
-      // Prefer keyword snippet if available (often more relevant)
-      if (r.snippet.length > 0) {
-        existing.snippet = r.snippet;
-      }
-    } else {
-      byId.set(r.id, {
-        id: r.id,
-        path: r.path,
-        startLine: r.startLine,
-        endLine: r.endLine,
-        source: r.source,
-        snippet: r.snippet,
-        vectorScore: 0,
-        textScore: r.textScore,
-      });
-    }
+fts_max[max(fs)] := fts[_, fs]
+fts_max[m] := m = 1.0, not fts[_, _]
+
+?[path, start_line, end_line, score, content, source] :=
+  vec[id, vs],
+  fts[id, fs],
+  fts_max[fm],
+  nfs = if(fm > 0.0, fs / fm, 0.0),
+  score = ${VECTOR_WEIGHT} * vs + ${TEXT_WEIGHT} * nfs,
+  *chunks{ id, path, start_line, end_line, content, source }
+
+?[path, start_line, end_line, score, content, source] :=
+  vec[id, vs],
+  not fts[id, _],
+  score = ${VECTOR_WEIGHT} * vs,
+  *chunks{ id, path, start_line, end_line, content, source }
+
+?[path, start_line, end_line, score, content, source] :=
+  fts[id, fs],
+  not vec[id, _],
+  fts_max[fm],
+  nfs = if(fm > 0.0, fs / fm, 0.0),
+  score = ${TEXT_WEIGHT} * nfs,
+  *chunks{ id, path, start_line, end_line, content, source }
+
+:order -score
+:limit $max_results
+`;
+
+/**
+ * Vector-only query: HNSW search without FTS (fallback when FTS fails).
+ *
+ * Produces rows: [path, start_line, end_line, score, content, source]
+ */
+const VECTOR_ONLY_QUERY = `
+vec[id, vs] :=
+  ~chunks:hnsw_embedding{ id |
+    query: vec($query_vec),
+    k: $candidate_limit,
+    ef: 100,
+    bind_distance: dist
+  },
+  vs = 1.0 - dist
+
+?[path, start_line, end_line, score, content, source] :=
+  vec[id, vs],
+  score = ${VECTOR_WEIGHT} * vs,
+  *chunks{ id, path, start_line, end_line, content, source }
+
+:order -score
+:limit $max_results
+`;
+
+/**
+ * FTS-only query: full-text search without vector search (when queryVec is empty).
+ *
+ * Produces rows: [path, start_line, end_line, score, content, source]
+ */
+const FTS_ONLY_QUERY = `
+fts[id, fs] :=
+  ~chunks:fts_content{ id |
+    query: $query_text,
+    k: $max_results,
+    score_kind: 'tf_idf',
+    bind_score: fs
   }
 
-  const merged = Array.from(byId.values()).map((entry) => ({
-    path: entry.path,
-    startLine: entry.startLine,
-    endLine: entry.endLine,
-    score: vectorWeight * entry.vectorScore + textWeight * entry.textScore,
-    snippet: entry.snippet,
-    source: entry.source,
-  }));
+?[path, start_line, end_line, score, content, source] :=
+  fts[id, fs],
+  score = fs,
+  *chunks{ id, path, start_line, end_line, content, source }
 
-  return merged.sort((a, b) => b.score - a.score);
-}
+:order -score
+:limit $max_results
+`;
 
 // ---------------------------------------------------------------------------
 // Main search function
 // ---------------------------------------------------------------------------
 
 /**
- * Performs hybrid search by combining vector similarity and BM25 keyword search.
+ * Performs hybrid search by combining vector similarity and FTS keyword search
+ * within a single CozoDB Datalog query.
  *
- * Implements weighted score fusion: fetches 4× the requested results as candidates
- * from each method (vector via extension or JS fallback, keyword via FTS), merges
- * by chunk ID with weighted scores (70% vector, 30% BM25), then returns the top
- * results. If queryVec is empty, only keyword search runs; if FTS is unavailable,
- * only vector search runs.
+ * Uses weighted score fusion: fetches 4× the requested results as candidates
+ * from each method (HNSW vector, FTS TF-IDF), merges by chunk ID with weighted
+ * scores (70% vector, 30% FTS), then returns the top results.
  *
- * @param state - Database state (db, vecAvailable, vecDimensions, ftsAvailable)
+ * If queryVec is empty, only FTS search runs. If FTS fails (e.g. bad syntax),
+ * falls back to vector-only results.
+ *
+ * @param state - Database state (db, embeddingDimensions)
  * @param queryVec - Embedding vector for semantic search (empty array skips vector search)
- * @param queryText - Raw query string for BM25 keyword search
- * @param options - Optional config; maxResults defaults to 20
- * @returns Sorted array of SearchResult (filePath, lineStart, lineEnd, snippet, score, model)
+ * @param queryText - Raw query string for FTS keyword search
+ * @param options - Optional config; maxResults defaults to 10
+ * @returns Sorted array of SearchResult (path, startLine, endLine, snippet, score, source)
  *
  * @example
  * const results = await hybridSearch(state, embedding, "foo bar", { maxResults: 10 });
@@ -338,45 +185,47 @@ export async function hybridSearch(
   const maxResults = options?.maxResults ?? DEFAULT_MAX_RESULTS;
   const candidateLimit = maxResults * CANDIDATE_MULTIPLIER;
 
-  // Get the provider model from meta
-  const meta = state.db
-    .prepare(`SELECT value FROM meta WHERE key = 'provider_model'`)
-    .get() as { value: string } | undefined;
-  const model = meta?.value ?? "";
+  // If no embedding schema yet (chunks table doesn't exist), no results
+  if (state.embeddingDimensions === null) return [];
 
-  // Vector search
-  let vectorResults: VectorResult[] = [];
+  let results: unknown[][];
+
   if (queryVec.length > 0) {
-    if (state.vecAvailable && state.vecDimensions) {
-      vectorResults = searchVectorViaExtension(
-        state.db,
-        queryVec,
-        model,
-        candidateLimit,
-      );
-    } else {
-      vectorResults = searchVectorViaJs(
-        state.db,
-        queryVec,
-        model,
-        candidateLimit,
-      );
+    // Full hybrid search (vector + FTS)
+    try {
+      const queryResult = await runQuery(state.db, HYBRID_QUERY, {
+        query_vec: queryVec,
+        query_text: queryText,
+        candidate_limit: candidateLimit,
+        max_results: maxResults,
+      });
+      results = queryResult.rows;
+    } catch {
+      // If hybrid fails (e.g. FTS parse error), fall back to vector-only
+      const queryResult = await runQuery(state.db, VECTOR_ONLY_QUERY, {
+        query_vec: queryVec,
+        candidate_limit: candidateLimit,
+        max_results: maxResults,
+      });
+      results = queryResult.rows;
     }
+  } else {
+    // FTS-only search (no embedding vector provided)
+    const queryResult = await runQuery(state.db, FTS_ONLY_QUERY, {
+      query_text: queryText,
+      max_results: maxResults,
+    });
+    results = queryResult.rows;
   }
 
-  // Keyword search
-  let keywordResults: KeywordResult[] = [];
-  if (state.ftsAvailable) {
-    keywordResults = searchKeyword(state.db, queryText, model, candidateLimit);
-  }
-
-  // Merge
-  const merged = mergeHybridResults(
-    vectorResults,
-    keywordResults,
-    VECTOR_WEIGHT,
-    TEXT_WEIGHT,
-  );
-
-  return merged.slice(0, maxResults);
+  // Map row arrays to SearchResult objects.
+  // Column order matches the ?[...] head: path, start_line, end_line, score, content, source
+  return results.map((row) => ({
+    path: row[0] as string,
+    startLine: row[1] as number,
+    endLine: row[2] as number,
+    score: row[3] as number,
+    snippet: truncateSnippet(row[4] as string, MAX_SNIPPET_CHARS),
+    source: row[5] as string,
+  }));
 }

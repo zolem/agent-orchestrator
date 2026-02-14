@@ -11,7 +11,7 @@
  */
 
 import { Command } from "commander";
-import { openDatabase, closeDatabase, getMemoryDir, getConfigDir } from "./db.js";
+import { openDatabase, closeDatabase, getMemoryDir, getConfigDir, runQuery } from "./db.js";
 import { createEmbeddingProvider } from "./embeddings.js";
 import { indexMemoryFiles } from "./indexer.js";
 import { hybridSearch } from "./search.js";
@@ -66,15 +66,13 @@ program
       process.exit(1);
     }
 
-    const state = openDatabase();
+    const state = await openDatabase();
     const provider = createEmbeddingProvider();
 
     try {
       if (opts.verbose) {
         console.log(`Memory dir: ${memoryDir}`);
-        console.log(`Database: ${state.db.name}`);
-        console.log(`FTS5: ${state.ftsAvailable ? "available" : "unavailable"}`);
-        console.log(`sqlite-vec: ${state.vecAvailable ? "available" : "unavailable"}`);
+        console.log(`Database: CozoDB (SQLite engine)`);
         console.log(`Embedding model: ${provider.modelId}`);
         console.log("");
       }
@@ -113,16 +111,15 @@ program
     ) => {
       const maxResults = parseInt(opts.maxResults ?? "10", 10);
 
-      const state = openDatabase();
+      const state = await openDatabase();
       const provider = createEmbeddingProvider();
 
       try {
         // Check if index exists
-        const fileCount = state.db
-          .prepare(`SELECT COUNT(*) as count FROM files`)
-          .get() as { count: number };
+        const fileCountResult = await runQuery(state.db, "?[count(path)] := *files{ path }");
+        const fileCount = (fileCountResult.rows[0]?.[0] as number) ?? 0;
 
-        if (fileCount.count === 0) {
+        if (fileCount === 0) {
           console.error("No files indexed yet. Run `memory-search index` first.");
           process.exit(1);
         }
@@ -166,28 +163,49 @@ program
 program
   .command("status")
   .description("Show index statistics")
-  .action(() => {
-    const state = openDatabase();
+  .action(async () => {
+    const state = await openDatabase();
     try {
-      const files = state.db
-        .prepare(`SELECT COUNT(*) as count FROM files`)
-        .get() as { count: number };
-      const chunks = state.db
-        .prepare(`SELECT COUNT(*) as count FROM chunks`)
-        .get() as { count: number };
-      const cache = state.db
-        .prepare(`SELECT COUNT(*) as count FROM embedding_cache`)
-        .get() as { count: number };
-      const model = state.db
-        .prepare(`SELECT value FROM meta WHERE key = 'provider_model'`)
-        .get() as { value: string } | undefined;
+      // File count
+      const filesResult = await runQuery(state.db, "?[count(path)] := *files{ path }");
+      const filesCount = (filesResult.rows[0]?.[0] as number) ?? 0;
 
-      console.log(`Files indexed:    ${files.count}`);
-      console.log(`Chunks stored:    ${chunks.count}`);
-      console.log(`Embedding cache:  ${cache.count} entries`);
-      console.log(`Embedding model:  ${model?.value ?? "(none)"}`);
-      console.log(`FTS5:             ${state.ftsAvailable ? "available" : "unavailable"}`);
-      console.log(`sqlite-vec:       ${state.vecAvailable ? "available" : "unavailable"}`);
+      // Chunk count (chunks may not exist yet)
+      let chunksCount = 0;
+      try {
+        const chunksResult = await runQuery(state.db, "?[count(id)] := *chunks{ id }");
+        chunksCount = (chunksResult.rows[0]?.[0] as number) ?? 0;
+      } catch {
+        // chunks relation doesn't exist yet
+      }
+
+      // Embedding cache count
+      let cacheCount = 0;
+      try {
+        const cacheResult = await runQuery(state.db, "?[count(hash)] := *embedding_cache{ hash }");
+        cacheCount = (cacheResult.rows[0]?.[0] as number) ?? 0;
+      } catch {
+        // embedding_cache relation doesn't exist yet
+      }
+
+      // Model from meta
+      let model = "(none)";
+      try {
+        const modelResult = await runQuery(state.db, "?[value] := *meta{ key: 'provider_model', value }");
+        if (modelResult.rows.length > 0) {
+          model = modelResult.rows[0][0] as string;
+        }
+      } catch {
+        // meta may be empty
+      }
+
+      console.log(`Files indexed:    ${filesCount}`);
+      console.log(`Chunks stored:    ${chunksCount}`);
+      console.log(`Embedding cache:  ${cacheCount} entries`);
+      console.log(`Embedding model:  ${model}`);
+      console.log(`Database:         CozoDB (SQLite engine)`);
+      console.log(`Vector search:    built-in (HNSW)`);
+      console.log(`Text search:      built-in (FTS)`);
     } finally {
       closeDatabase(state);
     }
@@ -238,7 +256,7 @@ program
     console.log(`Saved session: ${filePath}`);
 
     // Re-index
-    const state = openDatabase();
+    const state = await openDatabase();
     const provider = createEmbeddingProvider();
 
     try {
@@ -295,7 +313,7 @@ program
     console.log(`Updated memory: ${filePath}`);
 
     // Re-index
-    const state = openDatabase();
+    const state = await openDatabase();
     const provider = createEmbeddingProvider();
 
     try {
@@ -473,6 +491,181 @@ program
 
     console.log("\nUninstall complete.");
   });
+
+// ---------------------------------------------------------------------------
+// graph-status command
+// ---------------------------------------------------------------------------
+
+program
+  .command("graph-status")
+  .description("Show graph database statistics (node and edge counts)")
+  .action(async () => {
+    const state = await openDatabase();
+    try {
+      const { getGraphStats } = await import("./graph.js");
+      const stats = await getGraphStats(state.db);
+
+      console.log("Graph Node Counts:");
+      console.log(`  Users:     ${stats.nodes.users}`);
+      console.log(`  Errors:    ${stats.nodes.errors}`);
+      console.log(`  Solutions: ${stats.nodes.solutions}`);
+      console.log(`  Patterns:  ${stats.nodes.patterns}`);
+      console.log(`  Libraries: ${stats.nodes.libraries}`);
+      console.log(`  Sessions:  ${stats.nodes.sessions}`);
+      console.log("");
+      console.log("Graph Edge Counts:");
+      console.log(`  encountered:     ${stats.edges.encountered}`);
+      console.log(`  solved_by:       ${stats.edges.solved_by}`);
+      console.log(`  uses_lib:        ${stats.edges.uses_lib}`);
+      console.log(`  applies_pattern: ${stats.edges.applies_pattern}`);
+      console.log(`  prefers:         ${stats.edges.prefers}`);
+      console.log(`  avoids:          ${stats.edges.avoids}`);
+      console.log(`  conflicts_with:  ${stats.edges.conflicts_with}`);
+      console.log(`  similar_to:      ${stats.edges.similar_to}`);
+      console.log(`  caused_by:       ${stats.edges.caused_by}`);
+    } finally {
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// graph-update command
+// ---------------------------------------------------------------------------
+
+program
+  .command("graph-update")
+  .description("Extract entities from a session summary and update the graph database")
+  .option("--content <json>", "Session extraction JSON (if omitted, reads from stdin)")
+  .action(async (opts: { content?: string }) => {
+    // Resolve content from --content flag or stdin
+    let content: string;
+    if (opts.content != null) {
+      content = opts.content;
+    } else {
+      if (process.stdin.isTTY) {
+        console.error(
+          "Error: No content provided. Use --content <json> or pipe JSON via stdin.",
+        );
+        process.exit(1);
+      }
+      content = await readStdin();
+    }
+
+    let extraction: import("./graph.js").SessionExtraction | undefined;
+    try {
+      extraction = JSON.parse(content) as import("./graph.js").SessionExtraction;
+    } catch {
+      console.error("Error: Invalid JSON. Expected a SessionExtraction object.");
+      process.exit(1);
+    }
+
+    const state = await openDatabase();
+    try {
+      const { upsertGraphEntities } = await import("./graph.js");
+      const result = await upsertGraphEntities(state.db, extraction!);
+      console.log(`Graph updated: ${result.nodesCreated} nodes, ${result.edgesCreated} edges`);
+    } finally {
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// graph-query command
+// ---------------------------------------------------------------------------
+
+program
+  .command("graph-query <type>")
+  .description("Query the graph database. Types: errors, solutions, preferences, search-errors, search-solutions, causal-chain")
+  .option("--user <id>", "User ID for user-scoped queries", "default")
+  .option("--error <id>", "Error ID for error-scoped queries")
+  .option("--query <text>", "Search query for FTS-based graph queries")
+  .option("-n, --limit <n>", "Maximum results", "10")
+  .option("--json", "Output as JSON")
+  .action(
+    async (
+      type: string,
+      opts: { user?: string; error?: string; query?: string; limit?: string; json?: boolean },
+    ) => {
+      const state = await openDatabase();
+      const limit = parseInt(opts.limit ?? "10", 10);
+
+      try {
+        const graph = await import("./graph.js");
+        let result: unknown;
+
+        switch (type) {
+          case "errors": {
+            const userId = opts.user ?? "default";
+            result = await graph.queryUserErrors(state.db, userId);
+            break;
+          }
+          case "solutions": {
+            if (!opts.error) {
+              console.error("Error: --error <id> is required for 'solutions' query type.");
+              process.exit(1);
+            }
+            result = await graph.queryErrorSolutions(state.db, opts.error!);
+            break;
+          }
+          case "preferences": {
+            const userId = opts.user ?? "default";
+            result = await graph.queryUserPreferences(state.db, userId);
+            break;
+          }
+          case "search-errors": {
+            if (!opts.query) {
+              console.error("Error: --query <text> is required for 'search-errors' query type.");
+              process.exit(1);
+            }
+            result = await graph.searchErrors(state.db, opts.query!, limit);
+            break;
+          }
+          case "search-solutions": {
+            if (!opts.query) {
+              console.error("Error: --query <text> is required for 'search-solutions' query type.");
+              process.exit(1);
+            }
+            result = await graph.searchSolutions(state.db, opts.query!, limit);
+            break;
+          }
+          case "causal-chain": {
+            if (!opts.error) {
+              console.error("Error: --error <id> is required for 'causal-chain' query type.");
+              process.exit(1);
+            }
+            result = await graph.queryCausalChain(state.db, opts.error!);
+            break;
+          }
+          default:
+            console.error(
+              `Unknown query type: ${type}\n` +
+              "Available types: errors, solutions, preferences, search-errors, search-solutions, causal-chain",
+            );
+            process.exit(1);
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          // Pretty-print results
+          if (Array.isArray(result)) {
+            if (result.length === 0) {
+              console.log("No results found.");
+            } else {
+              for (const item of result) {
+                console.log(JSON.stringify(item, null, 2));
+                console.log("---");
+              }
+            }
+          } else {
+            console.log(JSON.stringify(result, null, 2));
+          }
+        }
+      } finally {
+        closeDatabase(state);
+      }
+    },
+  );
 
 // ---------------------------------------------------------------------------
 // Run

@@ -1,17 +1,17 @@
 /**
- * db.ts — SQLite schema setup for the memory search index.
+ * db.ts — CozoDB schema setup for the memory search index.
  *
- * Tables: meta, files, chunks, embedding_cache, chunks_fts (FTS5), chunks_vec (sqlite-vec).
- * Modeled after OpenClaw's memory-schema.ts with graceful degradation.
+ * Relations: meta, files, chunks, embedding_cache.
+ * Uses CozoDB's built-in FTS, HNSW vector search, and indexing.
  */
 
-import Database from "better-sqlite3";
+import { CozoDb } from "cozo-node";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 
-const require = createRequire(import.meta.url);
+// Re-export CozoDb type so other modules don't need to import cozo-node directly
+export type { CozoDb } from "cozo-node";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -20,7 +20,7 @@ const require = createRequire(import.meta.url);
 // Shared, tool-agnostic memory directory (XDG-style)
 const CONFIG_DIR = path.join(os.homedir(), ".config", "agent-orchestrator");
 const MEMORY_DIR = path.join(CONFIG_DIR, "memory");
-const DB_PATH = path.join(MEMORY_DIR, ".search-index.sqlite");
+const DB_PATH = path.join(MEMORY_DIR, ".search-index.cozo");
 
 export function getMemoryDir(): string {
   return MEMORY_DIR;
@@ -39,134 +39,208 @@ export function getConfigDir(): string {
 // ---------------------------------------------------------------------------
 
 export interface DbState {
-  db: Database.Database;
-  ftsAvailable: boolean;
-  vecAvailable: boolean;
-  vecDimensions: number | null; // null until first embedding stored
+  db: CozoDb;
+  embeddingDimensions: number | null; // null until first embedding; needed for HNSW index creation
 }
 
 // ---------------------------------------------------------------------------
-// Schema creation
+// Query helper
 // ---------------------------------------------------------------------------
 
-export function openDatabase(): DbState {
+export async function runQuery(
+  db: CozoDb,
+  query: string,
+  params?: Record<string, unknown>,
+): Promise<{ headers: string[]; rows: unknown[][] }> {
+  try {
+    return await db.run(query, params ?? {});
+  } catch (err: unknown) {
+    const message =
+      (err as { display?: string }).display ??
+      (err as Error).message ??
+      String(err);
+    throw new Error(`CozoDB query failed: ${message}\nQuery: ${query}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Schema helpers
+// ---------------------------------------------------------------------------
+
+/** Return the set of existing relation names in the database. */
+async function existingRelations(db: CozoDb): Promise<Set<string>> {
+  const result = await runQuery(db, "::relations");
+  return new Set(result.rows.map((r) => String(r[0])));
+}
+
+/** Return the set of existing index names for a given relation. */
+async function existingIndices(db: CozoDb, relation: string): Promise<Set<string>> {
+  try {
+    const result = await runQuery(db, `::indices ${relation}`);
+    return new Set(result.rows.map((r) => String(r[0])));
+  } catch {
+    // Relation may not exist yet
+    return new Set();
+  }
+}
+
+/**
+ * Create base relations (meta, files) that don't depend on embedding
+ * dimensions. Each relation is only created if it doesn't already exist.
+ */
+async function initBaseSchema(db: CozoDb): Promise<void> {
+  const names = await existingRelations(db);
+
+  if (!names.has("meta")) {
+    await runQuery(db, ":create meta { key: String => value: String }");
+  }
+
+  if (!names.has("files")) {
+    await runQuery(
+      db,
+      ":create files { path: String => source: String, hash: String, mtime: Int, size: Int }",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// openDatabase
+// ---------------------------------------------------------------------------
+
+export async function openDatabase(): Promise<DbState> {
   // Ensure the directory exists
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
-  const db = new Database(DB_PATH);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+  const db = new CozoDb("sqlite", DB_PATH);
 
-  // --- meta table ---
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS meta (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `);
+  await initBaseSchema(db);
 
-  // --- files table ---
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS files (
-      path   TEXT PRIMARY KEY,
-      source TEXT NOT NULL DEFAULT 'memory',
-      hash   TEXT NOT NULL,
-      mtime  INTEGER NOT NULL,
-      size   INTEGER NOT NULL
-    );
-  `);
+  // Initialize graph schema (node and edge relations)
+  // Lazy import to avoid circular dependency
+  const { initGraphSchema } = await import("./graph.js");
+  await initGraphSchema(db);
 
-  // --- chunks table ---
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS chunks (
-      id         TEXT PRIMARY KEY,
-      path       TEXT NOT NULL,
-      source     TEXT NOT NULL DEFAULT 'memory',
-      start_line INTEGER NOT NULL,
-      end_line   INTEGER NOT NULL,
-      hash       TEXT NOT NULL,
-      model      TEXT NOT NULL,
-      text       TEXT NOT NULL,
-      embedding  TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-  `);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_path   ON chunks(path);`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);`);
-
-  // --- embedding_cache table (SHA-256 keyed dedup) ---
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS embedding_cache (
-      hash       TEXT NOT NULL,
-      model      TEXT NOT NULL,
-      embedding  TEXT NOT NULL,
-      dims       INTEGER,
-      updated_at INTEGER NOT NULL,
-      PRIMARY KEY (hash, model)
-    );
-  `);
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON embedding_cache(updated_at);`,
-  );
-
-  // --- FTS5 virtual table (graceful fallback) ---
-  let ftsAvailable = false;
+  // Recover persisted embedding dimensions (if any)
+  let embeddingDimensions: number | null = null;
   try {
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-        text,
-        id UNINDEXED,
-        path UNINDEXED,
-        source UNINDEXED,
-        model UNINDEXED,
-        start_line UNINDEXED,
-        end_line UNINDEXED
-      );
-    `);
-    ftsAvailable = true;
+    const result = await runQuery(
+      db,
+      "?[value] := *meta{ key: 'embedding_dimensions', value }",
+    );
+    if (result.rows.length > 0) {
+      const parsed = parseInt(String(result.rows[0][0]), 10);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        embeddingDimensions = parsed;
+      }
+    }
   } catch {
-    // FTS5 not available on this platform — keyword search disabled
-    ftsAvailable = false;
+    // meta may be empty — that's fine
   }
 
-  // --- sqlite-vec extension loading ---
-  let vecAvailable = false;
-  try {
-    const sqliteVec = require("sqlite-vec");
-    sqliteVec.load(db);
-    vecAvailable = true;
-  } catch {
-    // sqlite-vec not available — will fall back to JS cosine similarity
-    vecAvailable = false;
-  }
-
-  return { db, ftsAvailable, vecAvailable, vecDimensions: null };
+  return { db, embeddingDimensions };
 }
 
 // ---------------------------------------------------------------------------
-// Lazy vector table creation (called when first embedding dimensions known)
+// Lazy embedding schema creation (replaces ensureVectorTable)
 // ---------------------------------------------------------------------------
 
-export function ensureVectorTable(state: DbState, dimensions: number): void {
-  if (state.vecDimensions === dimensions) return; // already created
+export async function ensureEmbeddingSchema(
+  state: DbState,
+  dimensions: number,
+): Promise<void> {
+  if (state.embeddingDimensions === dimensions) return; // already set up
 
-  if (!state.vecAvailable) return; // no sqlite-vec
+  const { db } = state;
+  const names = await existingRelations(db);
 
-  try {
-    // Drop and recreate if dimensions changed
-    if (state.vecDimensions !== null && state.vecDimensions !== dimensions) {
-      state.db.exec(`DROP TABLE IF EXISTS chunks_vec;`);
-    }
-    state.db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-        id TEXT PRIMARY KEY,
-        embedding float[${dimensions}]
-      );
-    `);
-    state.vecDimensions = dimensions;
-  } catch {
-    state.vecAvailable = false;
+  // If chunks exists but dimensions changed, drop everything and recreate
+  if (names.has("chunks") && state.embeddingDimensions !== null && state.embeddingDimensions !== dimensions) {
+    await runQuery(db, "::remove chunks");
+    await runQuery(db, "::remove embedding_cache");
+    // Refresh names after drop
+    names.delete("chunks");
+    names.delete("embedding_cache");
   }
+
+  // --- Create chunks relation ---
+  if (!names.has("chunks")) {
+    await runQuery(
+      db,
+      `:create chunks {
+        id: String
+        =>
+        path: String,
+        source: String,
+        start_line: Int,
+        end_line: Int,
+        hash: String,
+        model: String,
+        content: String,
+        embedding: <F32; ${dimensions}>,
+        updated_at: Int
+      }`,
+    );
+  }
+
+  // --- Create embedding_cache relation ---
+  if (!names.has("embedding_cache")) {
+    await runQuery(
+      db,
+      `:create embedding_cache {
+        hash: String,
+        model: String
+        =>
+        embedding: <F32; ${dimensions}>,
+        dims: Int,
+        updated_at: Int
+      }`,
+    );
+  }
+
+  // --- Create indices (idempotent: check before creating) ---
+  const chunkIndices = await existingIndices(db, "chunks");
+
+  if (!chunkIndices.has("idx_path")) {
+    await runQuery(db, "::index create chunks:idx_path { path, id }");
+  }
+
+  if (!chunkIndices.has("idx_source")) {
+    await runQuery(db, "::index create chunks:idx_source { source, id }");
+  }
+
+  if (!chunkIndices.has("fts_content")) {
+    await runQuery(
+      db,
+      `::fts create chunks:fts_content {
+        extractor: content,
+        tokenizer: Simple,
+        filters: [Lowercase, Stemmer('english'), Stopwords('en')]
+      }`,
+    );
+  }
+
+  if (!chunkIndices.has("hnsw_embedding")) {
+    await runQuery(
+      db,
+      `::hnsw create chunks:hnsw_embedding {
+        dim: ${dimensions},
+        m: 32,
+        dtype: F32,
+        fields: [embedding],
+        distance: Cosine,
+        ef_construction: 200
+      }`,
+    );
+  }
+
+  // --- Persist dimensions in meta ---
+  await runQuery(
+    db,
+    `?[key, value] <- [['embedding_dimensions', '${dimensions}']]
+     :put meta { key => value }`,
+  );
+
+  state.embeddingDimensions = dimensions;
 }
 
 // ---------------------------------------------------------------------------

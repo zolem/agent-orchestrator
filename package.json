@@ -21,13 +21,11 @@
     "start": "node bin/memory-search.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.0.0",
     "commander": "^13.0.0",
-    "node-llama-cpp": "^3.0.0",
-    "sqlite-vec": "^0.1.0"
+    "cozo-node": "^0.7.6",
+    "node-llama-cpp": "^3.0.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
     "esbuild": "^0.27.3",
     "typescript": "^5.7.0"
   },

@@ -4,12 +4,13 @@
  * Discovers markdown files in ~/.cursor/memory/, compares against stored
  * file hashes, and only re-chunks/re-embeds files that changed. Uses the
  * embedding_cache table to avoid re-embedding identical text.
+ *
+ * All storage uses CozoDB Datalog queries via runQuery().
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import type Database from "better-sqlite3";
-import { type DbState, ensureVectorTable } from "./db.js";
+import { type DbState, ensureEmbeddingSchema, runQuery } from "./db.js";
 import { chunkMarkdown, hashText } from "./chunker.js";
 import type { EmbeddingProvider } from "./embeddings.js";
 
@@ -43,7 +44,7 @@ export function listMemoryFiles(memoryDir: string): string[] {
   // MEMORY.md at root (check both casings, but only add one)
   const memoryFile = path.join(memoryDir, "MEMORY.md");
   const altMemoryFile = path.join(memoryDir, "memory.md");
-  
+
   if (fs.existsSync(memoryFile)) {
     result.push(memoryFile);
   } else if (fs.existsSync(altMemoryFile)) {
@@ -99,42 +100,45 @@ function chunkId(relPath: string, startLine: number, endLine: number): string {
 // Embedding cache helpers
 // ---------------------------------------------------------------------------
 
-function getCachedEmbedding(
-  db: Database.Database,
+/**
+ * Look up a cached embedding vector by text hash + model.
+ * Returns null if no cache entry exists.
+ */
+async function getCachedEmbedding(
+  db: DbState["db"],
   textHash: string,
   model: string,
-): number[] | null {
-  const row = db
-    .prepare(
-      `SELECT embedding FROM embedding_cache WHERE hash = ? AND model = ?`,
-    )
-    .get(textHash, model) as { embedding: string } | undefined;
-  if (!row) return null;
-  try {
-    return JSON.parse(row.embedding) as number[];
-  } catch {
-    return null;
-  }
+): Promise<number[] | null> {
+  const result = await runQuery(
+    db,
+    "?[embedding] := *embedding_cache{ hash: $hash, model: $model, embedding }",
+    { hash: textHash, model },
+  );
+  const firstRow = result.rows[0];
+  if (!firstRow) return null;
+  const embedding = firstRow[0];
+  // CozoDB returns vectors as number arrays natively — no JSON parsing needed
+  return Array.isArray(embedding) ? (embedding as number[]) : null;
 }
 
-function setCachedEmbedding(
-  db: Database.Database,
+/**
+ * Store an embedding vector in the cache, keyed by text hash + model.
+ */
+async function setCachedEmbedding(
+  db: DbState["db"],
   textHash: string,
   model: string,
   embedding: number[],
-): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO embedding_cache (hash, model, embedding, dims, updated_at)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(textHash, model, JSON.stringify(embedding), embedding.length, Date.now());
-}
-
-// ---------------------------------------------------------------------------
-// Vector table helpers
-// ---------------------------------------------------------------------------
-
-function vectorToBlob(embedding: number[]): Buffer {
-  return Buffer.from(new Float32Array(embedding).buffer);
+  dims: number,
+): Promise<void> {
+  await runQuery(
+    db,
+    `?[hash, model, embedding, dims, updated_at] <- [[
+      $hash, $model, vec($embedding), $dims, $now
+    ]]
+    :put embedding_cache { hash, model => embedding, dims, updated_at }`,
+    { hash: textHash, model, embedding, dims, now: Date.now() },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -170,46 +174,6 @@ export async function indexMemoryFiles(
     console.log(`Found ${files.length} memory file(s)`);
   }
 
-  // Prepared statements
-  const getFile = state.db.prepare(
-    `SELECT hash FROM files WHERE path = ?`,
-  );
-  const upsertFile = state.db.prepare(
-    `INSERT OR REPLACE INTO files (path, source, hash, mtime, size)
-     VALUES (?, 'memory', ?, ?, ?)`,
-  );
-  const deleteChunksByPath = state.db.prepare(
-    `DELETE FROM chunks WHERE path = ?`,
-  );
-  const insertChunk = state.db.prepare(
-    `INSERT OR REPLACE INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
-     VALUES (?, ?, 'memory', ?, ?, ?, ?, ?, ?, ?)`,
-  );
-
-  // FTS statements (only if available)
-  const deleteFtsByPath = state.ftsAvailable
-    ? state.db.prepare(`DELETE FROM chunks_fts WHERE path = ?`)
-    : null;
-  const insertFts = state.ftsAvailable
-    ? state.db.prepare(
-        `INSERT INTO chunks_fts (text, id, path, source, model, start_line, end_line)
-         VALUES (?, ?, ?, 'memory', ?, ?, ?)`,
-      )
-    : null;
-
-  // Helper to delete stale vec entries for a given path (must collect chunk IDs first)
-  function deleteVecByPath(filePath: string): void {
-    if (!state.vecAvailable) return;
-    const ids = state.db
-      .prepare(`SELECT id FROM chunks WHERE path = ?`)
-      .all(filePath) as Array<{ id: string }>;
-    if (ids.length === 0) return;
-    const deleteVec = state.db.prepare(`DELETE FROM chunks_vec WHERE id = ?`);
-    for (const row of ids) {
-      deleteVec.run(row.id);
-    }
-  }
-
   // Track all current file paths to detect deletions
   const currentPaths = new Set<string>();
 
@@ -218,8 +182,16 @@ export async function indexMemoryFiles(
     currentPaths.add(entry.relPath);
 
     // Check if file changed
-    const existing = getFile.get(entry.relPath) as { hash: string } | undefined;
-    if (existing && existing.hash === entry.hash) {
+    const existingResult = await runQuery(
+      state.db,
+      "?[hash] := *files{ path: $path, hash }",
+      { path: entry.relPath },
+    );
+    const firstRow = existingResult.rows[0];
+    const existingHash =
+      firstRow !== undefined ? (firstRow[0] as string) : null;
+
+    if (existingHash !== null && existingHash === entry.hash) {
       if (verbose) console.log(`  Unchanged: ${entry.relPath}`);
       continue;
     }
@@ -228,109 +200,139 @@ export async function indexMemoryFiles(
     if (verbose) console.log(`  Indexing: ${entry.relPath}`);
 
     // Update file record
-    upsertFile.run(entry.relPath, entry.hash, Math.floor(entry.mtimeMs), entry.size);
+    await runQuery(
+      state.db,
+      `?[path, source, hash, mtime, size] <- [[$path, 'memory', $hash, $mtime, $size]]
+       :put files { path => source, hash, mtime, size }`,
+      {
+        path: entry.relPath,
+        hash: entry.hash,
+        mtime: Math.floor(entry.mtimeMs),
+        size: entry.size,
+      },
+    );
 
-    // Remove old chunks for this file (vec first, since it needs chunk IDs from chunks table)
-    deleteVecByPath(entry.relPath);
-    deleteChunksByPath.run(entry.relPath);
-    deleteFtsByPath?.run(entry.relPath);
+    // Remove old chunks for this file (only if chunks relation exists)
+    if (state.embeddingDimensions !== null) {
+      try {
+        await runQuery(
+          state.db,
+          `?[id] := *chunks{ id, path: $path }
+           :rm chunks { id }`,
+          { path: entry.relPath },
+        );
+      } catch {
+        // chunks relation may not exist yet — that's OK
+      }
+    }
 
     // Chunk the content
     const chunks = chunkMarkdown(entry.content);
     if (chunks.length === 0) continue;
 
     // Embed all chunks (using cache where possible)
+    // Note: embedding_cache may not exist yet on the very first run.
+    // We embed the first chunk to learn dimensions, create the schema,
+    // then use the cache for subsequent chunks.
     const embeddings: number[][] = [];
     for (const chunk of chunks) {
-      const cached = getCachedEmbedding(state.db, chunk.hash, provider.modelId);
-      if (cached) {
-        embeddings.push(cached);
-        result.embeddingsCached++;
-      } else {
-        const vec = await provider.embed(chunk.text);
-        setCachedEmbedding(state.db, chunk.hash, provider.modelId, vec);
-        embeddings.push(vec);
-        result.embeddingsGenerated++;
-      }
-    }
-
-    // Ensure vector table exists with correct dimensions
-    const firstEmbedding = embeddings[0];
-    if (firstEmbedding && firstEmbedding.length > 0) {
-      ensureVectorTable(state, firstEmbedding.length);
-    }
-
-    // Prepare vec statements lazily (after table exists)
-    // Note: vec0 virtual tables don't support INSERT OR REPLACE, so we must
-    // delete-then-insert. We also clean up any orphaned vec entries here.
-    const deleteVecById = state.vecAvailable && state.vecDimensions
-      ? state.db.prepare(`DELETE FROM chunks_vec WHERE id = ?`)
-      : null;
-    const insertVec = state.vecAvailable && state.vecDimensions
-      ? state.db.prepare(`INSERT INTO chunks_vec (id, embedding) VALUES (?, ?)`)
-      : null;
-
-    // Insert chunks in a transaction
-    const insertAll = state.db.transaction(() => {
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const embedding = embeddings[i];
-        if (!chunk || !embedding) continue;
-        const id = chunkId(entry.relPath, chunk.startLine, chunk.endLine);
-
-        insertChunk.run(
-          id,
-          entry.relPath,
-          chunk.startLine,
-          chunk.endLine,
+      // Try cache only if embedding schema is ready
+      if (state.embeddingDimensions !== null) {
+        const cached = await getCachedEmbedding(
+          state.db,
           chunk.hash,
           provider.modelId,
-          chunk.text,
-          JSON.stringify(embedding),
-          Date.now(),
         );
-
-        // FTS insert
-        insertFts?.run(
-          chunk.text,
-          id,
-          entry.relPath,
-          provider.modelId,
-          chunk.startLine,
-          chunk.endLine,
-        );
-
-        // Vector insert (delete first to handle orphaned entries from prior runs)
-        deleteVecById?.run(id);
-        insertVec?.run(id, vectorToBlob(embedding));
+        if (cached) {
+          embeddings.push(cached);
+          result.embeddingsCached++;
+          continue;
+        }
       }
 
-      result.chunksIndexed += chunks.length;
-    });
+      // Cache miss or schema not ready — generate embedding
+      const vec = await provider.embed(chunk.text);
 
-    insertAll();
+      // Ensure embedding schema exists with correct dimensions (lazy init)
+      if (state.embeddingDimensions === null && vec.length > 0) {
+        await ensureEmbeddingSchema(state, vec.length);
+      }
+
+      // Now cache the embedding
+      await setCachedEmbedding(
+        state.db,
+        chunk.hash,
+        provider.modelId,
+        vec,
+        vec.length,
+      );
+      embeddings.push(vec);
+      result.embeddingsGenerated++;
+    }
+
+    // Insert all chunks in a batch via :put
+    // CozoDB automatically updates FTS and HNSW indices on :put
+    const rows = chunks.map((chunk, i) => [
+      chunkId(entry.relPath, chunk.startLine, chunk.endLine),
+      entry.relPath,
+      "memory",
+      chunk.startLine,
+      chunk.endLine,
+      chunk.hash,
+      provider.modelId,
+      chunk.text,
+      embeddings[i],
+      Date.now(),
+    ]);
+
+    await runQuery(
+      state.db,
+      `?[id, path, source, start_line, end_line, hash, model, content, embedding, updated_at] <- $rows
+       :put chunks { id => path, source, start_line, end_line, hash, model, content, embedding, updated_at }`,
+      { rows },
+    );
+
+    result.chunksIndexed += chunks.length;
   }
 
   // Remove stale files (files in DB but no longer on disk)
-  const allDbFiles = state.db
-    .prepare(`SELECT path FROM files`)
-    .all() as Array<{ path: string }>;
-  for (const row of allDbFiles) {
-    if (!currentPaths.has(row.path)) {
-      if (verbose) console.log(`  Removing stale: ${row.path}`);
-      deleteVecByPath(row.path);
-      state.db.prepare(`DELETE FROM files WHERE path = ?`).run(row.path);
-      state.db.prepare(`DELETE FROM chunks WHERE path = ?`).run(row.path);
-      if (state.ftsAvailable) {
-        state.db.prepare(`DELETE FROM chunks_fts WHERE path = ?`).run(row.path);
+  const allDbFiles = await runQuery(state.db, "?[path] := *files{ path }");
+  for (const row of allDbFiles.rows) {
+    const dbPath = row[0] as string;
+    if (!currentPaths.has(dbPath)) {
+      if (verbose) console.log(`  Removing stale: ${dbPath}`);
+
+      // Delete chunks for this path (only if chunks relation exists)
+      if (state.embeddingDimensions !== null) {
+        try {
+          await runQuery(
+            state.db,
+            `?[id] := *chunks{ id, path: $path }
+             :rm chunks { id }`,
+            { path: dbPath },
+          );
+        } catch {
+          // chunks relation may not exist yet
+        }
       }
+
+      // Delete file record
+      await runQuery(
+        state.db,
+        `?[path] <- [[$path]]
+         :rm files { path }`,
+        { path: dbPath },
+      );
     }
   }
 
   // Store provider fingerprint
-  state.db
-    .prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES ('provider_model', ?)`)
-    .run(provider.modelId);
+  await runQuery(
+    state.db,
+    `?[key, value] <- [['provider_model', $model]]
+     :put meta { key => value }`,
+    { model: provider.modelId },
+  );
 
   return result;
 }
