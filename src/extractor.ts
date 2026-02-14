@@ -34,6 +34,7 @@
 import { parseFrontmatter, hashText } from "./chunker.js";
 import type {
   SessionExtraction,
+  GraphEntities,
   ErrorEntity,
   SolutionEntity,
   LibraryEntity,
@@ -41,6 +42,8 @@ import type {
   LessonEntity,
   PatternEntity,
 } from "./graph.js";
+import { execSync } from "node:child_process";
+import path from "node:path";
 
 // ---------------------------------------------------------------------------
 // Section extraction
@@ -477,7 +480,6 @@ export function extractSessionEntities(
  */
 export function detectProjectFromGit(cwd?: string): string | null {
   try {
-    const { execSync } = require("node:child_process");
     const options = cwd ? { cwd, encoding: "utf-8" as const } : { encoding: "utf-8" as const };
 
     // Try to get the repo name from git remote
@@ -494,11 +496,9 @@ export function detectProjectFromGit(cwd?: string): string | null {
 
     // Fall back to git repo root directory name
     const root = execSync("git rev-parse --show-toplevel", options).toString().trim();
-    const path = require("node:path");
     return path.basename(root);
   } catch {
     // Not in a git repo, use cwd directory name
-    const path = require("node:path");
     const dir = cwd ?? process.cwd();
     return path.basename(dir);
   }

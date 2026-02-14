@@ -639,7 +639,7 @@ program
               console.error("Error: --error <id> is required for 'solutions' query type.");
               process.exit(1);
             }
-            result = await graph.queryErrorSolutions(state.db, opts.error);
+            result = await graph.queryErrorSolutions(state.db, opts.error!);
             break;
           }
           case "preferences": {
@@ -673,7 +673,7 @@ program
               console.error("Error: --query <text> is required for 'search-errors' query type.");
               process.exit(1);
             }
-            result = await graph.searchErrors(state.db, opts.query, limit);
+            result = await graph.searchErrors(state.db, opts.query!, limit);
             break;
           }
           case "search-solutions": {
@@ -681,7 +681,7 @@ program
               console.error("Error: --query <text> is required for 'search-solutions' query type.");
               process.exit(1);
             }
-            result = await graph.searchSolutions(state.db, opts.query, limit);
+            result = await graph.searchSolutions(state.db, opts.query!, limit);
             break;
           }
           case "causal-chain": {
@@ -689,7 +689,7 @@ program
               console.error("Error: --error <id> is required for 'causal-chain' query type.");
               process.exit(1);
             }
-            result = await graph.queryCausalChain(state.db, opts.error);
+            result = await graph.queryCausalChain(state.db, opts.error!);
             break;
           }
           default:

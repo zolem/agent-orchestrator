@@ -208,8 +208,6 @@ function parseMarkdownSections(
           startLine: lineNo,
           breadcrumbs: [],
         };
-      } else if (currentSection) {
-        currentSection.lines.push(line);
       }
     }
   }
