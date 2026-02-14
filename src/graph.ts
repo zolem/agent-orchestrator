@@ -48,6 +48,24 @@ export interface LibraryEntity {
   context?: string;
 }
 
+export interface PreferenceEntity {
+  name: string;
+  description?: string;
+  scope: "global" | "project";
+  projectName?: string; // Only set if scope is "project"
+  strength?: number; // 0-1, how strongly the user prefers this
+}
+
+export interface LessonEntity {
+  name: string;
+  description?: string;
+  projectName?: string; // null for global lessons
+}
+
+export interface ProjectEntity {
+  name: string;
+}
+
 export interface RelationshipEntity {
   from: string;
   relationship:
@@ -71,12 +89,15 @@ export interface GraphEntities {
   solutions: SolutionEntity[];
   patterns: PatternEntity[];
   libraries: LibraryEntity[];
+  preferences: PreferenceEntity[];
+  lessons: LessonEntity[];
   relationships: RelationshipEntity[];
 }
 
 export interface SessionExtraction {
   sessionId: string;
   userId: string;
+  projectName: string;
   sessionTimestamp: number;
   sessionDurationMinutes?: number;
   overallSuccess: boolean;
@@ -304,10 +325,64 @@ export async function initGraphSchema(db: CozoDb): Promise<void> {
         id: String
         =>
         slug: String?,
+        project_id: String?,
         started_at: Int,
         ended_at: Int?,
         summary: String?,
         overall_success: Bool?,
+        metadata: String?
+      }`,
+    );
+  }
+
+  // --- New node types for project scoping ---
+
+  if (!names.has("project_node")) {
+    await runQuery(
+      db,
+      `:create project_node {
+        id: String
+        =>
+        name: String,
+        first_seen: Int,
+        last_seen: Int,
+        session_count: Int,
+        metadata: String?
+      }`,
+    );
+  }
+
+  if (!names.has("preference_node")) {
+    await runQuery(
+      db,
+      `:create preference_node {
+        id: String
+        =>
+        name: String,
+        description: String?,
+        scope: String,
+        project_id: String?,
+        strength: Float,
+        times_confirmed: Int,
+        first_learned: Int,
+        last_confirmed: Int,
+        metadata: String?
+      }`,
+    );
+  }
+
+  if (!names.has("lesson_node")) {
+    await runQuery(
+      db,
+      `:create lesson_node {
+        id: String
+        =>
+        name: String,
+        description: String?,
+        project_id: String?,
+        times_relevant: Int,
+        first_learned: Int,
+        last_referenced: Int,
         metadata: String?
       }`,
     );
@@ -378,6 +453,22 @@ export async function initGraphSchema(db: CozoDb): Promise<void> {
     );
   }
 
+  // --- New edge types for project scoping ---
+
+  if (!names.has("in_project")) {
+    await runQuery(
+      db,
+      ":create in_project { entity_id: String, project_id: String => entity_type: String, timestamp: Int }",
+    );
+  }
+
+  if (!names.has("learned_from")) {
+    await runQuery(
+      db,
+      ":create learned_from { entity_id: String, session_id: String => entity_type: String, timestamp: Int }",
+    );
+  }
+
   // --- FTS indices on node names ---
 
   const errorIndices = await existingIndices(db, "error_node");
@@ -409,6 +500,32 @@ export async function initGraphSchema(db: CozoDb): Promise<void> {
     await runQuery(
       db,
       `::fts create pattern_node:fts_name {
+        extractor: name,
+        tokenizer: Simple,
+        filters: [Lowercase, Stemmer('english')]
+      }`,
+    );
+  }
+
+  // FTS indices for new node types
+
+  const preferenceIndices = await existingIndices(db, "preference_node");
+  if (!preferenceIndices.has("fts_name")) {
+    await runQuery(
+      db,
+      `::fts create preference_node:fts_name {
+        extractor: name,
+        tokenizer: Simple,
+        filters: [Lowercase, Stemmer('english')]
+      }`,
+    );
+  }
+
+  const lessonIndices = await existingIndices(db, "lesson_node");
+  if (!lessonIndices.has("fts_name")) {
+    await runQuery(
+      db,
+      `::fts create lesson_node:fts_name {
         extractor: name,
         tokenizer: Simple,
         filters: [Lowercase, Stemmer('english')]
@@ -703,18 +820,170 @@ async function upsertSessionNode(
 
   await runQuery(
     db,
-    `?[id, slug, started_at, ended_at, summary, overall_success, metadata] <- [[
-      $id, null, $started, $ended, $notes, $success, null
+    `?[id, slug, project_id, started_at, ended_at, summary, overall_success, metadata] <- [[
+      $id, null, $project_id, $started, $ended, $notes, $success, null
     ]]
-    :put session_node { id => slug, started_at, ended_at, summary, overall_success, metadata }`,
+    :put session_node { id => slug, project_id, started_at, ended_at, summary, overall_success, metadata }`,
     {
       id: extraction.sessionId,
+      project_id: extraction.projectName ? entityId("project", extraction.projectName) : null,
       started: extraction.sessionTimestamp,
       ended: endedAt,
       notes: extraction.notes ?? null,
       success: extraction.overallSuccess,
     },
   );
+}
+
+async function upsertProjectNode(
+  db: CozoDb,
+  projectName: string,
+  sessionTimestamp: number,
+): Promise<string> {
+  const id = entityId("project", projectName);
+
+  const existing = await runQuery(
+    db,
+    "?[session_count, first_seen] := *project_node{ id: $id, session_count, first_seen }",
+    { id },
+  );
+
+  let sessionCount: number;
+  let firstSeen: number;
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0] as [number, number];
+    sessionCount = row[0] + 1;
+    firstSeen = row[1];
+  } else {
+    sessionCount = 1;
+    firstSeen = sessionTimestamp;
+  }
+
+  await runQuery(
+    db,
+    `?[id, name, first_seen, last_seen, session_count, metadata] <- [[
+      $id, $name, $first, $last, $count, null
+    ]]
+    :put project_node { id => name, first_seen, last_seen, session_count, metadata }`,
+    {
+      id,
+      name: projectName,
+      first: firstSeen,
+      last: sessionTimestamp,
+      count: sessionCount,
+    },
+  );
+
+  return id;
+}
+
+async function upsertPreferenceNode(
+  db: CozoDb,
+  preference: PreferenceEntity,
+  sessionTimestamp: number,
+): Promise<string> {
+  // Generate ID based on scope and name
+  const idSuffix = preference.scope === "project" && preference.projectName
+    ? `${preference.projectName}:${preference.name}`
+    : preference.name;
+  const id = entityId("preference", idSuffix);
+
+  const projectId = preference.scope === "project" && preference.projectName
+    ? entityId("project", preference.projectName)
+    : null;
+
+  const existing = await runQuery(
+    db,
+    "?[times_confirmed, first_learned] := *preference_node{ id: $id, times_confirmed, first_learned }",
+    { id },
+  );
+
+  let timesConfirmed: number;
+  let firstLearned: number;
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0] as [number, number];
+    timesConfirmed = row[0] + 1;
+    firstLearned = row[1];
+  } else {
+    timesConfirmed = 1;
+    firstLearned = sessionTimestamp;
+  }
+
+  await runQuery(
+    db,
+    `?[id, name, description, scope, project_id, strength, times_confirmed, first_learned, last_confirmed, metadata] <- [[
+      $id, $name, $desc, $scope, $project, $strength, $times, $first, $last, null
+    ]]
+    :put preference_node { id => name, description, scope, project_id, strength, times_confirmed, first_learned, last_confirmed, metadata }`,
+    {
+      id,
+      name: preference.name,
+      desc: preference.description ?? null,
+      scope: preference.scope,
+      project: projectId,
+      strength: preference.strength ?? 0.8,
+      times: timesConfirmed,
+      first: firstLearned,
+      last: sessionTimestamp,
+    },
+  );
+
+  return id;
+}
+
+async function upsertLessonNode(
+  db: CozoDb,
+  lesson: LessonEntity,
+  sessionTimestamp: number,
+): Promise<string> {
+  // Generate ID based on project scope and name
+  const idSuffix = lesson.projectName
+    ? `${lesson.projectName}:${lesson.name}`
+    : lesson.name;
+  const id = entityId("lesson", idSuffix);
+
+  const projectId = lesson.projectName
+    ? entityId("project", lesson.projectName)
+    : null;
+
+  const existing = await runQuery(
+    db,
+    "?[times_relevant, first_learned] := *lesson_node{ id: $id, times_relevant, first_learned }",
+    { id },
+  );
+
+  let timesRelevant: number;
+  let firstLearned: number;
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0] as [number, number];
+    timesRelevant = row[0] + 1;
+    firstLearned = row[1];
+  } else {
+    timesRelevant = 1;
+    firstLearned = sessionTimestamp;
+  }
+
+  await runQuery(
+    db,
+    `?[id, name, description, project_id, times_relevant, first_learned, last_referenced, metadata] <- [[
+      $id, $name, $desc, $project, $times, $first, $last, null
+    ]]
+    :put lesson_node { id => name, description, project_id, times_relevant, first_learned, last_referenced, metadata }`,
+    {
+      id,
+      name: lesson.name,
+      desc: lesson.description ?? null,
+      project: projectId,
+      times: timesRelevant,
+      first: firstLearned,
+      last: sessionTimestamp,
+    },
+  );
+
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +1000,8 @@ function buildNameIndex(
   solutionIds: Map<string, string>,
   patternIds: Map<string, string>,
   libraryIds: Map<string, string>,
+  preferenceIds?: Map<string, string>,
+  lessonIds?: Map<string, string>,
 ): Map<string, string> {
   const index = new Map<string, string>();
 
@@ -738,12 +1009,55 @@ function buildNameIndex(
   solutionIds.forEach((id, key) => { index.set(key, id); });
   patternIds.forEach((id, key) => { index.set(key, id); });
   libraryIds.forEach((id, key) => { index.set(key, id); });
+  preferenceIds?.forEach((id, key) => { index.set(key, id); });
+  lessonIds?.forEach((id, key) => { index.set(key, id); });
 
-  // Also allow lookup by user/session ID directly
+  // Also allow lookup by user/session/project ID directly
   index.set(extraction.userId, extraction.userId);
   index.set(extraction.sessionId, extraction.sessionId);
+  if (extraction.projectName) {
+    index.set(extraction.projectName, entityId("project", extraction.projectName));
+  }
 
   return index;
+}
+
+// ---------------------------------------------------------------------------
+// New edge upsert helpers
+// ---------------------------------------------------------------------------
+
+async function upsertInProjectEdge(
+  db: CozoDb,
+  entityId: string,
+  projectId: string,
+  entityType: string,
+  timestamp: number,
+): Promise<void> {
+  await runQuery(
+    db,
+    `?[entity_id, project_id, entity_type, timestamp] <- [[
+      $entity, $project, $type, $ts
+    ]]
+    :put in_project { entity_id, project_id => entity_type, timestamp }`,
+    { entity: entityId, project: projectId, type: entityType, ts: timestamp },
+  );
+}
+
+async function upsertLearnedFromEdge(
+  db: CozoDb,
+  entityId: string,
+  sessionId: string,
+  entityType: string,
+  timestamp: number,
+): Promise<void> {
+  await runQuery(
+    db,
+    `?[entity_id, session_id, entity_type, timestamp] <- [[
+      $entity, $session, $type, $ts
+    ]]
+    :put learned_from { entity_id, session_id => entity_type, timestamp }`,
+    { entity: entityId, session: sessionId, type: entityType, ts: timestamp },
+  );
 }
 
 function resolveId(name: string, nameIndex: Map<string, string>): string {
@@ -906,52 +1220,118 @@ export async function upsertGraphEntities(
   await upsertUserNode(db, extraction.userId, ts);
   nodesCreated++;
 
-  // 2. Ensure session node exists
+  // 2. Ensure project node exists (if project specified)
+  let projectId: string | null = null;
+  if (extraction.projectName) {
+    projectId = await upsertProjectNode(db, extraction.projectName, ts);
+    nodesCreated++;
+  }
+
+  // 3. Ensure session node exists
   await upsertSessionNode(db, extraction);
   nodesCreated++;
 
-  // 3. Upsert error nodes
+  // 4. Upsert error nodes
   const errorIds = new Map<string, string>();
   for (const error of extraction.entities.errors) {
     const id = await upsertErrorNode(db, error, ts);
     errorIds.set(error.name, id);
     nodesCreated++;
+
+    // Link error to project
+    if (projectId) {
+      await upsertInProjectEdge(db, id, projectId, "error", ts);
+      edgesCreated++;
+    }
+    // Link error to session
+    await upsertLearnedFromEdge(db, id, extraction.sessionId, "error", ts);
+    edgesCreated++;
   }
 
-  // 4. Upsert solution nodes
+  // 5. Upsert solution nodes
   const solutionIds = new Map<string, string>();
   for (const solution of extraction.entities.solutions) {
     const id = await upsertSolutionNode(db, solution, ts);
     solutionIds.set(solution.name, id);
     nodesCreated++;
+
+    // Link solution to project
+    if (projectId) {
+      await upsertInProjectEdge(db, id, projectId, "solution", ts);
+      edgesCreated++;
+    }
+    // Link solution to session
+    await upsertLearnedFromEdge(db, id, extraction.sessionId, "solution", ts);
+    edgesCreated++;
   }
 
-  // 5. Upsert pattern nodes
+  // 6. Upsert pattern nodes
   const patternIds = new Map<string, string>();
   for (const pattern of extraction.entities.patterns) {
     const id = await upsertPatternNode(db, pattern, ts);
     patternIds.set(pattern.name, id);
     nodesCreated++;
+
+    // Link pattern to project
+    if (projectId) {
+      await upsertInProjectEdge(db, id, projectId, "pattern", ts);
+      edgesCreated++;
+    }
+    // Link pattern to session
+    await upsertLearnedFromEdge(db, id, extraction.sessionId, "pattern", ts);
+    edgesCreated++;
   }
 
-  // 6. Upsert library nodes
+  // 7. Upsert library nodes
   const libraryIds = new Map<string, string>();
   for (const library of extraction.entities.libraries) {
     const id = await upsertLibraryNode(db, library, ts);
     libraryIds.set(library.name, id);
     nodesCreated++;
+
+    // Link library to project
+    if (projectId) {
+      await upsertInProjectEdge(db, id, projectId, "library", ts);
+      edgesCreated++;
+    }
   }
 
-  // 7. Build name→ID index for relationship resolution
+  // 8. Upsert preference nodes
+  const preferenceIds = new Map<string, string>();
+  for (const preference of extraction.entities.preferences ?? []) {
+    const id = await upsertPreferenceNode(db, preference, ts);
+    preferenceIds.set(preference.name, id);
+    nodesCreated++;
+
+    // Link preference to session
+    await upsertLearnedFromEdge(db, id, extraction.sessionId, "preference", ts);
+    edgesCreated++;
+  }
+
+  // 9. Upsert lesson nodes
+  const lessonIds = new Map<string, string>();
+  for (const lesson of extraction.entities.lessons ?? []) {
+    const id = await upsertLessonNode(db, lesson, ts);
+    lessonIds.set(lesson.name, id);
+    nodesCreated++;
+
+    // Link lesson to session
+    await upsertLearnedFromEdge(db, id, extraction.sessionId, "lesson", ts);
+    edgesCreated++;
+  }
+
+  // 10. Build name→ID index for relationship resolution
   const nameIndex = buildNameIndex(
     extraction,
     errorIds,
     solutionIds,
     patternIds,
     libraryIds,
+    preferenceIds,
+    lessonIds,
   );
 
-  // 8. Upsert relationship edges
+  // 11. Upsert relationship edges
   for (const rel of extraction.entities.relationships) {
     await upsertRelationship(
       db,
@@ -1279,4 +1659,275 @@ export async function queryCausalChain(
   }
 
   return chain;
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped query functions
+// ---------------------------------------------------------------------------
+
+export interface ProjectPreference {
+  name: string;
+  description: string | null;
+  scope: "global" | "project";
+  projectName: string | null;
+  strength: number;
+  timesConfirmed: number;
+  lastConfirmed: number;
+}
+
+export interface ProjectLesson {
+  name: string;
+  description: string | null;
+  projectName: string | null;
+  timesRelevant: number;
+  lastReferenced: number;
+}
+
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  firstSeen: number;
+  lastSeen: number;
+  sessionCount: number;
+}
+
+/**
+ * Get all projects the user has worked on.
+ */
+export async function queryProjects(
+  db: CozoDb,
+): Promise<ProjectInfo[]> {
+  const result = await runQuery(
+    db,
+    `
+    ?[id, name, first_seen, last_seen, session_count] :=
+      *project_node{ id, name, first_seen, last_seen, session_count }
+    :order -last_seen
+    `,
+  );
+
+  return result.rows.map((row) => ({
+    id: row[0] as string,
+    name: row[1] as string,
+    firstSeen: row[2] as number,
+    lastSeen: row[3] as number,
+    sessionCount: row[4] as number,
+  }));
+}
+
+/**
+ * Query preferences with human-readable names and project scoping.
+ * Returns both global preferences and project-specific preferences.
+ */
+export async function queryPreferences(
+  db: CozoDb,
+  projectName?: string,
+): Promise<ProjectPreference[]> {
+  // Query the new preference_node table directly
+  const result = await runQuery(
+    db,
+    `
+    ?[name, description, scope, project_name, strength, times_confirmed, last_confirmed] :=
+      *preference_node{
+        id, name, description, scope, project_id, strength,
+        times_confirmed, last_confirmed
+      },
+      *project_node{ id: project_id, name: project_name }
+      
+    ?[name, description, scope, project_name, strength, times_confirmed, last_confirmed] :=
+      *preference_node{
+        id, name, description, scope, project_id, strength,
+        times_confirmed, last_confirmed
+      },
+      project_id = null,
+      project_name = null
+      
+    :order -last_confirmed
+    `,
+  );
+
+  let preferences = result.rows.map((row) => ({
+    name: row[0] as string,
+    description: row[1] as string | null,
+    scope: row[2] as "global" | "project",
+    projectName: row[3] as string | null,
+    strength: row[4] as number,
+    timesConfirmed: row[5] as number,
+    lastConfirmed: row[6] as number,
+  }));
+
+  // Filter by project if specified
+  if (projectName) {
+    preferences = preferences.filter(
+      (p) => p.scope === "global" || p.projectName === projectName
+    );
+  }
+
+  return preferences;
+}
+
+/**
+ * Query lessons with project scoping.
+ */
+export async function queryLessons(
+  db: CozoDb,
+  projectName?: string,
+): Promise<ProjectLesson[]> {
+  const result = await runQuery(
+    db,
+    `
+    ?[name, description, project_name, times_relevant, last_referenced] :=
+      *lesson_node{
+        id, name, description, project_id, times_relevant, last_referenced
+      },
+      *project_node{ id: project_id, name: project_name }
+      
+    ?[name, description, project_name, times_relevant, last_referenced] :=
+      *lesson_node{
+        id, name, description, project_id, times_relevant, last_referenced
+      },
+      project_id = null,
+      project_name = null
+      
+    :order -last_referenced
+    `,
+  );
+
+  let lessons = result.rows.map((row) => ({
+    name: row[0] as string,
+    description: row[1] as string | null,
+    projectName: row[2] as string | null,
+    timesRelevant: row[3] as number,
+    lastReferenced: row[4] as number,
+  }));
+
+  // Filter by project if specified (include global lessons too)
+  if (projectName) {
+    lessons = lessons.filter(
+      (l) => l.projectName === null || l.projectName === projectName
+    );
+  }
+
+  return lessons;
+}
+
+/**
+ * Get a unified recall context for the memory-recall-agent.
+ * Combines preferences, lessons, and recent errors for a given project.
+ */
+export interface RecallContext {
+  project: ProjectInfo | null;
+  globalPreferences: ProjectPreference[];
+  projectPreferences: ProjectPreference[];
+  globalLessons: ProjectLesson[];
+  projectLessons: ProjectLesson[];
+  recentErrors: UserError[];
+  recentSolutions: Array<{ errorName: string; solutionName: string; successRate: number }>;
+}
+
+export async function getRecallContext(
+  db: CozoDb,
+  projectName?: string,
+  userId = "default",
+): Promise<RecallContext> {
+  // Get project info if available
+  let project: ProjectInfo | null = null;
+  if (projectName) {
+    const projects = await queryProjects(db);
+    project = projects.find((p) => p.name === projectName) ?? null;
+  }
+
+  // Get preferences
+  const allPreferences = await queryPreferences(db, projectName);
+  const globalPreferences = allPreferences.filter((p) => p.scope === "global");
+  const projectPreferences = allPreferences.filter(
+    (p) => p.scope === "project" && p.projectName === projectName
+  );
+
+  // Get lessons
+  const allLessons = await queryLessons(db, projectName);
+  const globalLessons = allLessons.filter((l) => l.projectName === null);
+  const projectLessons = allLessons.filter((l) => l.projectName === projectName);
+
+  // Get recent errors
+  const recentErrors = await queryUserErrors(db, userId);
+
+  // Get solutions for recent errors
+  const recentSolutions: Array<{ errorName: string; solutionName: string; successRate: number }> = [];
+  for (const error of recentErrors.slice(0, 5)) {
+    const solutions = await queryErrorSolutions(db, error.errorId);
+    for (const solution of solutions) {
+      recentSolutions.push({
+        errorName: error.errorName,
+        solutionName: solution.solutionName,
+        successRate: solution.successRate,
+      });
+    }
+  }
+
+  return {
+    project,
+    globalPreferences,
+    projectPreferences,
+    globalLessons,
+    projectLessons,
+    recentErrors: recentErrors.slice(0, 10),
+    recentSolutions,
+  };
+}
+
+/**
+ * Format recall context as human-readable text for the recall agent.
+ */
+export function formatRecallContext(context: RecallContext): string {
+  const lines: string[] = [];
+
+  if (context.project) {
+    lines.push(`## Current Project: ${context.project.name}`);
+    lines.push(`- Sessions: ${context.project.sessionCount}`);
+    lines.push(`- Last worked on: ${new Date(context.project.lastSeen).toLocaleDateString()}`);
+    lines.push("");
+  }
+
+  if (context.globalPreferences.length > 0) {
+    lines.push("## Global Preferences");
+    for (const pref of context.globalPreferences) {
+      lines.push(`- ${pref.name}${pref.description ? ` — ${pref.description}` : ""}`);
+    }
+    lines.push("");
+  }
+
+  if (context.projectPreferences.length > 0) {
+    lines.push(`## Project Preferences (${context.project?.name ?? "current"})`);
+    for (const pref of context.projectPreferences) {
+      lines.push(`- ${pref.name}${pref.description ? ` — ${pref.description}` : ""}`);
+    }
+    lines.push("");
+  }
+
+  if (context.globalLessons.length > 0) {
+    lines.push("## Global Lessons");
+    for (const lesson of context.globalLessons.slice(0, 10)) {
+      lines.push(`- ${lesson.name}`);
+    }
+    lines.push("");
+  }
+
+  if (context.projectLessons.length > 0) {
+    lines.push(`## Project Lessons (${context.project?.name ?? "current"})`);
+    for (const lesson of context.projectLessons.slice(0, 10)) {
+      lines.push(`- ${lesson.name}`);
+    }
+    lines.push("");
+  }
+
+  if (context.recentSolutions.length > 0) {
+    lines.push("## Known Solutions");
+    for (const sol of context.recentSolutions.slice(0, 10)) {
+      lines.push(`- ${sol.errorName} → ${sol.solutionName} (${Math.round(sol.successRate * 100)}% success)`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
 }

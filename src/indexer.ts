@@ -11,8 +11,91 @@
 import fs from "node:fs";
 import path from "node:path";
 import { type DbState, ensureEmbeddingSchema, runQuery } from "./db.js";
-import { chunkMarkdown, hashText } from "./chunker.js";
+import { chunkMarkdown, hashText, parseFrontmatter, type Chunk } from "./chunker.js";
 import type { EmbeddingProvider } from "./embeddings.js";
+
+// ---------------------------------------------------------------------------
+// Metadata extraction
+// ---------------------------------------------------------------------------
+
+interface FileMetadata {
+  fileType: "session-log" | "memory" | "other";
+  project?: string;
+  date?: string;
+  tags?: string[];
+}
+
+/**
+ * Extract metadata from file path and content.
+ * - Session logs: sessions/YYYY-MM-DD-slug.md
+ * - MEMORY.md: the curated memory file
+ * - Other: any other markdown file
+ */
+function extractFileMetadata(relPath: string, content: string): FileMetadata {
+  const metadata: FileMetadata = { fileType: "other" };
+
+  // Determine file type from path
+  if (relPath.startsWith("sessions/")) {
+    metadata.fileType = "session-log";
+
+    // Extract date from filename: sessions/YYYY-MM-DD-slug.md
+    const filename = path.basename(relPath, ".md");
+    const dateMatch = filename.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (dateMatch) {
+      metadata.date = dateMatch[1];
+    }
+  } else if (relPath.toLowerCase() === "memory.md") {
+    metadata.fileType = "memory";
+  }
+
+  // Parse YAML frontmatter for project, tags, date
+  const { frontmatter } = parseFrontmatter(content);
+  if (frontmatter) {
+    if (typeof frontmatter.project === "string") {
+      metadata.project = frontmatter.project;
+    }
+    if (typeof frontmatter.date === "string") {
+      metadata.date = frontmatter.date;
+    }
+    if (Array.isArray(frontmatter.tags)) {
+      metadata.tags = frontmatter.tags.filter((t): t is string => typeof t === "string");
+    }
+  }
+
+  return metadata;
+}
+
+/**
+ * Build a metadata prefix string for a chunk.
+ * Format: [session-log | project: X | date: YYYY-MM-DD]
+ */
+function buildMetadataPrefix(metadata: FileMetadata): string {
+  const parts: string[] = [metadata.fileType];
+
+  if (metadata.project) {
+    parts.push(`project: ${metadata.project}`);
+  }
+  if (metadata.date) {
+    parts.push(`date: ${metadata.date}`);
+  }
+
+  return `[${parts.join(" | ")}]`;
+}
+
+/**
+ * Prepend metadata to chunk text for better embedding context.
+ * The chunk already has breadcrumbs from the chunker; we add file-level metadata.
+ */
+function enrichChunkWithMetadata(chunk: Chunk, metadata: FileMetadata): Chunk {
+  const prefix = buildMetadataPrefix(metadata);
+  const enrichedText = `${prefix}\n${chunk.text}`;
+
+  return {
+    ...chunk,
+    text: enrichedText,
+    hash: hashText(enrichedText), // Recalculate hash with new content
+  };
+}
 
 // ---------------------------------------------------------------------------
 // File discovery
@@ -226,9 +309,15 @@ export async function indexMemoryFiles(
       }
     }
 
-    // Chunk the content
-    const chunks = chunkMarkdown(entry.content);
-    if (chunks.length === 0) continue;
+    // Extract file metadata for context enrichment
+    const metadata = extractFileMetadata(entry.relPath, entry.content);
+
+    // Chunk the content (includes breadcrumbs from chunker)
+    const rawChunks = chunkMarkdown(entry.content);
+    if (rawChunks.length === 0) continue;
+
+    // Enrich chunks with file-level metadata
+    const chunks = rawChunks.map((chunk) => enrichChunkWithMetadata(chunk, metadata));
 
     // Embed all chunks (using cache where possible)
     // Note: embedding_cache may not exist yet on the very first run.

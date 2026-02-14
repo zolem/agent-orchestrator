@@ -12,9 +12,51 @@ You will receive:
 1. The path to a session log file (raw notes from a just-completed session)
 2. The path to MEMORY.md (the curated long-term memory)
 
-Read both files before making any changes.
+Read both files before making any changes. Parse the session log's YAML frontmatter to extract the `project` field.
+
+## MEMORY.md Structure
+
+MEMORY.md uses project-scoped sections:
+
+```markdown
+# Orchestrator Memory
+
+## Global Preferences
+- <preferences that apply to ALL projects>
+
+## Project Preferences
+### <project-name>
+- <preferences specific to this project>
+
+## Sub-Agent Patterns
+- <patterns, not project-scoped>
+
+## Decisions Log
+- <decisions, not project-scoped>
+
+## Lessons Learned
+### Global
+- <lessons that apply everywhere>
+
+### <project-name>
+- <lessons specific to this project>
+
+## Anti-Patterns
+- <anti-patterns, not project-scoped>
+```
 
 ## Update Rules
+
+### Project scoping from session logs
+
+The session log contains a `## Preferences Learned` section with scope tags:
+- `[global]` entries → **Global Preferences** section
+- `[project]` entries → **Project Preferences > {project}** subsection
+
+The session log contains a `## Patterns Learned` section:
+- Add to **Lessons Learned > {project}** unless clearly universal
+
+If the project subsection doesn't exist, create it.
 
 ### Preferences are upserted, not appended
 
@@ -37,20 +79,22 @@ Bad: `- The user mentioned in our conversation that they generally prefer to use
 Before adding an entry, check if it already exists in MEMORY.md:
 - **Already exists, unchanged** — skip it
 - **Already exists, outdated** — overwrite with new value
-- **New information** — add it to the appropriate section
+- **New information** — add it to the appropriate section (respecting project scope)
 
 ### Categorization
 
 Place entries in the correct section:
-- **User Preferences**: Coding style, communication preferences, tool preferences, review expectations
+- **Global Preferences**: Preferences that apply to ALL projects (explicitly tagged `[global]`)
+- **Project Preferences > {project}**: Preferences specific to one project
 - **Sub-Agent Patterns**: Prompt structures that worked, model selection lessons, effective constraints
 - **Decisions Log**: Architectural or process decisions with brief rationale
-- **Lessons Learned**: Categorize by project type (CRUD, API, UI, performance, etc.)
+- **Lessons Learned > Global**: Lessons that apply everywhere
+- **Lessons Learned > {project}**: Lessons specific to a project
 - **Anti-Patterns**: Things that consistently fail or waste time
 
 ### Conciseness limit
 
-Keep MEMORY.md under **100 lines** of actual content (excluding section headers and blank lines). If an update would push it over:
+Keep MEMORY.md under **150 lines** of actual content (excluding section headers and blank lines). If an update would push it over:
 1. Prune entries that have been superseded or are no longer relevant
 2. Consolidate related entries into single lines
 3. Remove the least actionable entries first

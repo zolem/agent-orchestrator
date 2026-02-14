@@ -15,6 +15,8 @@ import { openDatabase, closeDatabase, getMemoryDir, getConfigDir, runQuery } fro
 import { createEmbeddingProvider } from "./embeddings.js";
 import { indexMemoryFiles } from "./indexer.js";
 import { hybridSearch } from "./search.js";
+import { extractSessionEntities, detectProjectFromGit } from "./extractor.js";
+import { upsertGraphEntities } from "./graph.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -217,12 +219,14 @@ program
 
 program
   .command("save-session")
-  .description("Write a session log file and re-index")
+  .description("Write a session log file, extract entities to graph, and re-index")
   .requiredOption("--slug <slug>", "Slug for the session filename (YYYY-MM-DD-<slug>.md)")
   .option("--content <content>", "Session content (if omitted, reads from stdin)")
   .option("--memory-dir <path>", "Override memory directory path")
-  .action(async (opts: { slug: string; content?: string; memoryDir?: string }) => {
+  .option("--no-extract", "Skip automatic entity extraction to graph")
+  .action(async (opts: { slug: string; content?: string; memoryDir?: string; extract?: boolean }) => {
     const memoryDir = opts.memoryDir ?? getMemoryDir();
+    const shouldExtract = opts.extract !== false;
 
     // Resolve content from --content flag or stdin
     let content: string;
@@ -261,14 +265,43 @@ program
 
     try {
       console.log("Indexing memory files...");
-      const result = await indexMemoryFiles(state, provider, memoryDir);
+      const indexResult = await indexMemoryFiles(state, provider, memoryDir);
 
       console.log("");
-      console.log(`Files scanned:        ${result.filesScanned}`);
-      console.log(`Files changed:        ${result.filesChanged}`);
-      console.log(`Chunks indexed:       ${result.chunksIndexed}`);
-      console.log(`Embeddings generated: ${result.embeddingsGenerated}`);
-      console.log(`Embeddings cached:    ${result.embeddingsCached}`);
+      console.log(`Files scanned:        ${indexResult.filesScanned}`);
+      console.log(`Files changed:        ${indexResult.filesChanged}`);
+      console.log(`Chunks indexed:       ${indexResult.chunksIndexed}`);
+      console.log(`Embeddings generated: ${indexResult.embeddingsGenerated}`);
+      console.log(`Embeddings cached:    ${indexResult.embeddingsCached}`);
+
+      // Auto-extract entities from the session
+      if (shouldExtract) {
+        console.log("");
+        console.log("Extracting entities from session...");
+
+        try {
+          const extraction = extractSessionEntities(content);
+
+          // If no project was found in frontmatter, try to detect from git
+          if (!extraction.projectName) {
+            const detected = detectProjectFromGit();
+            if (detected) {
+              extraction.projectName = detected;
+            }
+          }
+
+          const graphResult = await upsertGraphEntities(state.db, extraction);
+          console.log(`Graph updated: ${graphResult.nodesCreated} nodes, ${graphResult.edgesCreated} edges`);
+
+          if (extraction.projectName) {
+            console.log(`Project: ${extraction.projectName}`);
+          }
+        } catch (err) {
+          // Don't fail the whole command if extraction fails
+          console.error("Warning: Entity extraction failed:", (err as Error).message);
+        }
+      }
+
       console.log("");
       console.log("Done.");
     } finally {
@@ -575,16 +608,17 @@ program
 
 program
   .command("graph-query <type>")
-  .description("Query the graph database. Types: errors, solutions, preferences, search-errors, search-solutions, causal-chain")
+  .description("Query the graph database. Types: errors, solutions, preferences, lessons, projects, recall, search-errors, search-solutions, causal-chain")
   .option("--user <id>", "User ID for user-scoped queries", "default")
   .option("--error <id>", "Error ID for error-scoped queries")
+  .option("--project <name>", "Project name for project-scoped queries")
   .option("--query <text>", "Search query for FTS-based graph queries")
   .option("-n, --limit <n>", "Maximum results", "10")
   .option("--json", "Output as JSON")
   .action(
     async (
       type: string,
-      opts: { user?: string; error?: string; query?: string; limit?: string; json?: boolean },
+      opts: { user?: string; error?: string; project?: string; query?: string; limit?: string; json?: boolean },
     ) => {
       const state = await openDatabase();
       const limit = parseInt(opts.limit ?? "10", 10);
@@ -592,6 +626,7 @@ program
       try {
         const graph = await import("./graph.js");
         let result: unknown;
+        let formatted: string | null = null;
 
         switch (type) {
           case "errors": {
@@ -604,12 +639,33 @@ program
               console.error("Error: --error <id> is required for 'solutions' query type.");
               process.exit(1);
             }
-            result = await graph.queryErrorSolutions(state.db, opts.error!);
+            result = await graph.queryErrorSolutions(state.db, opts.error);
             break;
           }
           case "preferences": {
-            const userId = opts.user ?? "default";
-            result = await graph.queryUserPreferences(state.db, userId);
+            // Use new project-scoped query
+            result = await graph.queryPreferences(state.db, opts.project);
+            break;
+          }
+          case "lessons": {
+            result = await graph.queryLessons(state.db, opts.project);
+            break;
+          }
+          case "projects": {
+            result = await graph.queryProjects(state.db);
+            break;
+          }
+          case "recall": {
+            // Get unified recall context
+            const context = await graph.getRecallContext(
+              state.db,
+              opts.project,
+              opts.user ?? "default",
+            );
+            result = context;
+            if (!opts.json) {
+              formatted = graph.formatRecallContext(context);
+            }
             break;
           }
           case "search-errors": {
@@ -617,7 +673,7 @@ program
               console.error("Error: --query <text> is required for 'search-errors' query type.");
               process.exit(1);
             }
-            result = await graph.searchErrors(state.db, opts.query!, limit);
+            result = await graph.searchErrors(state.db, opts.query, limit);
             break;
           }
           case "search-solutions": {
@@ -625,7 +681,7 @@ program
               console.error("Error: --query <text> is required for 'search-solutions' query type.");
               process.exit(1);
             }
-            result = await graph.searchSolutions(state.db, opts.query!, limit);
+            result = await graph.searchSolutions(state.db, opts.query, limit);
             break;
           }
           case "causal-chain": {
@@ -633,19 +689,22 @@ program
               console.error("Error: --error <id> is required for 'causal-chain' query type.");
               process.exit(1);
             }
-            result = await graph.queryCausalChain(state.db, opts.error!);
+            result = await graph.queryCausalChain(state.db, opts.error);
             break;
           }
           default:
             console.error(
               `Unknown query type: ${type}\n` +
-              "Available types: errors, solutions, preferences, search-errors, search-solutions, causal-chain",
+              "Available types: errors, solutions, preferences, lessons, projects, recall, search-errors, search-solutions, causal-chain",
             );
             process.exit(1);
         }
 
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
+        } else if (formatted) {
+          // Use pre-formatted output
+          console.log(formatted);
         } else {
           // Pretty-print results
           if (Array.isArray(result)) {

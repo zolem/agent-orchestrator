@@ -70,14 +70,23 @@ See the **Harness-Specific Configuration** section at the end of this document f
 
 ### MEMORY.md Structure
 
+MEMORY.md separates global knowledge from project-specific knowledge:
+
 ```markdown
 # Orchestrator Memory
 
-## User Preferences
-- Coding style preferences (formatting, naming conventions)
-- Review preferences (how thorough, what to focus on)
-- Communication style (concise vs detailed, emojis or not)
-- Tech stack opinions (preferred libraries, patterns to use/avoid)
+## Global Preferences
+- <preferences that apply to ALL projects>
+- Coding style, communication style, review expectations
+- Never commit without explicit user approval
+
+## Project Preferences
+### <project-name>
+- <preferences specific to this project>
+- Tool choices, workflow preferences, codebase conventions
+
+### <another-project>
+- <preferences for another project>
 
 ## Sub-Agent Patterns
 - Effective prompt structures for each agent role
@@ -89,14 +98,11 @@ See the **Harness-Specific Configuration** section at the end of this document f
 - Process decisions (how to handle certain task types)
 
 ## Lessons Learned
-### CRUD Apps
-- [lesson entries]
-### API Integrations
-- [lesson entries]
-### UI Components
-- [lesson entries]
-### Performance Optimization
-- [lesson entries]
+### Global
+- <lessons that apply across all projects>
+
+### <project-name>
+- <lessons specific to this project>
 
 ## Anti-Patterns
 - Prompts that consistently fail
@@ -104,14 +110,27 @@ See the **Harness-Specific Configuration** section at the end of this document f
 - Agent configurations to avoid
 ```
 
+**Key structure rules:**
+- **Global Preferences**: Apply to every project (e.g., "never commit without approval")
+- **Project Preferences**: Scoped by project name (e.g., "uses Graphite" for web-app)
+- **Lessons Learned**: Split into Global and per-project subsections
+- When a session log contains `[global]` tagged preferences, they go to Global Preferences
+- When tagged `[project]` or untagged, they go to the current project's section
+
 ### Session Log Format
 
-Each session log (`<memory-dir>/sessions/YYYY-MM-DD-<slug>.md`) should contain:
+Each session log (`<memory-dir>/sessions/YYYY-MM-DD-<slug>.md`) uses YAML frontmatter and standardized sections for machine-parseable extraction:
 
 ```markdown
+---
+date: YYYY-MM-DD
+project: <project name from git repo or explicit>
+tags: [<relevant tags>]
+tools: [<libraries/tools used>]
+outcome: success | partial | failed
+---
+
 # Session: <brief description>
-Date: YYYY-MM-DD
-Project: <project name>
 
 ## Task
 <what was requested>
@@ -119,18 +138,42 @@ Project: <project name>
 ## Outcome
 <what was delivered, user rating if given>
 
+## Errors Encountered
+- <error name>: <description> [solved/unsolved]
+  - Solution: <what fixed it, if solved>
+
+## Tools & Libraries Used
+- <tool/library name> (<version if relevant>): <how it was used>
+
 ## Sub-Agents Used
 - <agent-name>: <performance notes>
 
 ## What Worked
 - <specific successes>
 
-## What Failed / Could Improve
+## What Failed
 - <specific failures or friction points>
 
-## Learnings to Distill
-- <items to add to MEMORY.md>
+## Preferences Learned
+- [global] <preference that applies to all projects>
+- [project] <preference specific to this project>
+
+## Patterns Learned
+- <reusable pattern or lesson>
 ```
+
+**Frontmatter fields:**
+- `date`: Session date (YYYY-MM-DD)
+- `project`: Auto-detected from git repo name, or specify explicitly
+- `tags`: Categorization tags (e.g., `migration`, `bugfix`, `feature`)
+- `tools`: Libraries/tools used in this session
+- `outcome`: `success`, `partial`, or `failed`
+
+**Structured sections for graph extraction:**
+- **Errors Encountered**: Each error gets a graph node; solutions link via `solved_by` edge
+- **Tools & Libraries Used**: Each tool/library becomes a `library_node`
+- **Preferences Learned**: `[global]` or `[project]` prefix determines scope
+- **Patterns Learned**: Reusable insights become `pattern_node` entries
 
 ### Memory Lifecycle
 
