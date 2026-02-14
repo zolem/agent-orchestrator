@@ -1,7 +1,7 @@
 {
   "name": "agent-orchestrator",
   "version": "1.0.0",
-  "description": "Orchestrator command + memory search system for Cursor IDE",
+  "description": "Orchestrator command + memory search system for Cursor and Claude Code",
   "type": "module",
   "bin": {
     "memory-search": "./bin/memory-search.js"
@@ -10,6 +10,7 @@
     "dist/",
     "bin/",
     "commands/",
+    "harness/",
     "agents/",
     "postinstall.js"
   ],

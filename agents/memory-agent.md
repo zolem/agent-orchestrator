@@ -4,7 +4,7 @@ model: claude-4.5-haiku
 description: Memory curator. Use at the end of orchestrator sessions to distill session logs into long-term memory.
 ---
 
-You are a memory curator for an orchestrator agent. Your job is to update the long-term memory file (`~/.cursor/memory/MEMORY.md`) based on a raw session log.
+You are a memory curator for an orchestrator agent. Your job is to update the long-term memory file (`~/.config/agent-orchestrator/memory/MEMORY.md`) based on a raw session log.
 
 ## Input
 
@@ -70,7 +70,7 @@ After updating MEMORY.md, run the search index refresh so new memories are immed
 memory-search index
 ```
 
-This updates the vector + keyword search index at `~/.cursor/memory/.search-index.sqlite`. If the command is not available (not installed), skip this step silently — the orchestrator can still read MEMORY.md directly.
+This updates the vector + keyword search index at `~/.config/agent-orchestrator/memory/.search-index.sqlite`. If the command is not available (not installed), skip this step silently — the orchestrator can still read MEMORY.md directly.
 
 ## Output
 

@@ -9,7 +9,7 @@
  */
 
 import { Command } from "commander";
-import { openDatabase, closeDatabase, getMemoryDir } from "./db.js";
+import { openDatabase, closeDatabase, getMemoryDir, getConfigDir } from "./db.js";
 import { createEmbeddingProvider } from "./embeddings.js";
 import { indexMemoryFiles } from "./indexer.js";
 import { hybridSearch } from "./search.js";
@@ -24,7 +24,7 @@ const program = new Command();
 program
   .name("memory-search")
   .description(
-    "Hybrid vector + BM25 memory search for the Cursor orchestrator command",
+    "Hybrid vector + BM25 memory search for the agent-orchestrator (Cursor/Claude Code)",
   )
   .version("1.0.0");
 
@@ -34,7 +34,7 @@ program
 
 program
   .command("index")
-  .description("Index or re-index all markdown files in ~/.cursor/memory/")
+  .description("Index or re-index all markdown files in the memory directory")
   .option("-v, --verbose", "Show detailed indexing progress")
   .option("--memory-dir <path>", "Override memory directory path")
   .action(async (opts: { verbose?: boolean; memoryDir?: string }) => {
@@ -43,7 +43,7 @@ program
     if (!fs.existsSync(memoryDir)) {
       console.error(`Memory directory not found: ${memoryDir}`);
       console.error(
-        "Create it with: mkdir -p ~/.cursor/memory",
+        "Create it with: mkdir -p ~/.config/agent-orchestrator/memory",
       );
       process.exit(1);
     }
@@ -184,19 +184,37 @@ program
   .description("Remove all installed orchestrator files and uninstall the package")
   .action(async () => {
     const home = os.homedir();
+    const configDir = getConfigDir();
     const cursorDir = path.join(home, ".cursor");
-    const memoryDir = path.join(cursorDir, "memory");
+    const claudeDir = path.join(home, ".claude");
 
-    // Files the postinstall created
-    const installedFiles = [
-      path.join(cursorDir, "commands", "orchestrator.md"),
-      path.join(cursorDir, "agents", "memory-agent.md"),
-      path.join(cursorDir, "agents", "memory-recall-agent.md"),
-    ];
+    // Files/symlinks the postinstall created (for each platform)
+    const installedFiles: string[] = [];
+    const installedSymlinks: string[] = [];
 
-    // Directories the postinstall created (only removed if empty)
+    // Cursor files
+    if (fs.existsSync(cursorDir)) {
+      installedFiles.push(
+        path.join(cursorDir, "commands", "orchestrator.md"),
+        path.join(cursorDir, "agents", "memory-agent.md"),
+        path.join(cursorDir, "agents", "memory-recall-agent.md"),
+      );
+      installedSymlinks.push(path.join(cursorDir, "agents", "dynamic"));
+    }
+
+    // Claude Code files
+    if (fs.existsSync(claudeDir)) {
+      installedFiles.push(
+        path.join(claudeDir, "skills", "orchestrator", "SKILL.md"),
+        path.join(claudeDir, "agents", "memory-agent.md"),
+        path.join(claudeDir, "agents", "memory-recall-agent.md"),
+      );
+      installedSymlinks.push(path.join(claudeDir, "agents", "dynamic"));
+    }
+
+    // Directories created by postinstall (only removed if empty)
     const installedDirs = [
-      path.join(cursorDir, "agents", "dynamic"),
+      path.join(claudeDir, "skills", "orchestrator"),
     ];
 
     console.log("This will remove:\n");
@@ -204,6 +222,15 @@ program
     for (const file of installedFiles) {
       if (fs.existsSync(file)) {
         console.log(`  ${file}`);
+      }
+    }
+    for (const link of installedSymlinks) {
+      try {
+        if (fs.lstatSync(link).isSymbolicLink()) {
+          console.log(`  ${link} (symlink)`);
+        }
+      } catch {
+        // doesn't exist
       }
     }
     for (const dir of installedDirs) {
@@ -214,7 +241,7 @@ program
 
     console.log("");
 
-    // Ask about memory data
+    // Ask about shared data
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -224,7 +251,7 @@ program
       new Promise((resolve) => rl.question(question, resolve));
 
     const dataAnswer = await ask(
-      `Do you want to delete your memory data at ${memoryDir}?\n` +
+      `Do you want to delete your shared data at ${configDir}?\n` +
       "  This includes MEMORY.md, session logs, the search index, and the\n" +
       "  downloaded embedding model (~0.6GB).\n\n" +
       "  [k]eep data for later  /  [d]elete everything: ",
@@ -248,6 +275,19 @@ program
       }
     }
 
+    // Remove symlinks
+    for (const link of installedSymlinks) {
+      try {
+        const stats = fs.lstatSync(link);
+        if (stats.isSymbolicLink()) {
+          fs.unlinkSync(link);
+          console.log(`  Removed: ${link} (symlink)`);
+        }
+      } catch {
+        // doesn't exist, skip
+      }
+    }
+
     // Remove empty directories
     for (const dir of installedDirs) {
       try {
@@ -266,21 +306,21 @@ program
       }
     }
 
-    // Optionally delete memory data
+    // Optionally delete shared data
     if (deleteData) {
       try {
-        fs.rmSync(memoryDir, { recursive: true, force: true });
-        console.log(`  Removed: ${memoryDir}/`);
+        fs.rmSync(configDir, { recursive: true, force: true });
+        console.log(`  Removed: ${configDir}/`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`  Warning: could not remove ${memoryDir}: ${msg}`);
+        console.warn(`  Warning: could not remove ${configDir}: ${msg}`);
       }
     } else {
-      console.log(`  Kept:    ${memoryDir}/`);
+      console.log(`  Kept:    ${configDir}/`);
     }
 
     // Uninstall the npm package
-    console.log("\nUninstalling cursor-orchestrator...\n");
+    console.log("\nUninstalling agent-orchestrator...\n");
     try {
       execSync("npm uninstall -g agent-orchestrator", { stdio: "inherit" });
     } catch {

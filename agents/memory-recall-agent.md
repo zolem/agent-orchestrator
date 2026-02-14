@@ -17,7 +17,7 @@ You will receive:
 
 ### Step 1: Read Curated Memory
 
-Read `~/.cursor/memory/MEMORY.md` in full. This contains the user's preferences, effective sub-agent patterns, decision history, lessons learned, and anti-patterns.
+Read `~/.config/agent-orchestrator/memory/MEMORY.md` in full. This contains the user's preferences, effective sub-agent patterns, decision history, lessons learned, and anti-patterns.
 
 Extract everything that's relevant to the current task.
 
@@ -31,7 +31,7 @@ If the search returns no results or the command is unavailable, skip to Step 4 u
 
 For the top 3-5 results (by score, ignoring any below 0.25), read the full source sections using the Read tool:
 - Use the `path` and `startLine`/`endLine` from each result
-- Memory files live at `~/.cursor/memory/<path>`
+- Memory files live at `~/.config/agent-orchestrator/memory/<path>`
 - Focus on session logs — they contain detailed context that MEMORY.md only summarizes
 
 ### Step 4: Synthesize

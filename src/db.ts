@@ -17,7 +17,9 @@ const require = createRequire(import.meta.url);
 // Paths
 // ---------------------------------------------------------------------------
 
-const MEMORY_DIR = path.join(os.homedir(), ".cursor", "memory");
+// Shared, tool-agnostic memory directory (XDG-style)
+const CONFIG_DIR = path.join(os.homedir(), ".config", "agent-orchestrator");
+const MEMORY_DIR = path.join(CONFIG_DIR, "memory");
 const DB_PATH = path.join(MEMORY_DIR, ".search-index.sqlite");
 
 export function getMemoryDir(): string {
@@ -26,6 +28,10 @@ export function getMemoryDir(): string {
 
 export function getDbPath(): string {
   return DB_PATH;
+}
+
+export function getConfigDir(): string {
+  return CONFIG_DIR;
 }
 
 // ---------------------------------------------------------------------------
