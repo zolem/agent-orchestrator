@@ -2,10 +2,12 @@
  * cli.ts — CLI entry point for memory-search.
  *
  * Commands:
- *   memory-search index     — Index/re-index memory files
- *   memory-search query     — Hybrid search over indexed memories
- *   memory-search status    — Show index statistics
- *   memory-search uninstall — Remove all installed files and optionally delete data
+ *   memory-search index          — Index/re-index memory files
+ *   memory-search query          — Hybrid search over indexed memories
+ *   memory-search status         — Show index statistics
+ *   memory-search save-session   — Write a session log file and re-index
+ *   memory-search update-memory  — Overwrite MEMORY.md and re-index
+ *   memory-search uninstall      — Remove all installed files and optionally delete data
  */
 
 import { Command } from "commander";
@@ -18,6 +20,22 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { execSync } from "node:child_process";
+
+/**
+ * Read all of stdin into a string. Returns a promise that resolves with the
+ * full contents once the stream ends.
+ */
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
+    });
+    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("error", reject);
+  });
+}
 
 const program = new Command();
 
@@ -171,6 +189,129 @@ program
       console.log(`FTS5:             ${state.ftsAvailable ? "available" : "unavailable"}`);
       console.log(`sqlite-vec:       ${state.vecAvailable ? "available" : "unavailable"}`);
     } finally {
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// save-session command
+// ---------------------------------------------------------------------------
+
+program
+  .command("save-session")
+  .description("Write a session log file and re-index")
+  .requiredOption("--slug <slug>", "Slug for the session filename (YYYY-MM-DD-<slug>.md)")
+  .option("--content <content>", "Session content (if omitted, reads from stdin)")
+  .option("--memory-dir <path>", "Override memory directory path")
+  .action(async (opts: { slug: string; content?: string; memoryDir?: string }) => {
+    const memoryDir = opts.memoryDir ?? getMemoryDir();
+
+    // Resolve content from --content flag or stdin
+    let content: string;
+    if (opts.content != null) {
+      content = opts.content;
+    } else {
+      if (process.stdin.isTTY) {
+        console.error(
+          "Error: No content provided. Use --content <string> or pipe content via stdin.",
+        );
+        process.exit(1);
+      }
+      content = await readStdin();
+    }
+
+    // Build the filename: YYYY-MM-DD-<slug>.md
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const dd = String(today.getDate()).padStart(2, "0");
+    const filename = `${yyyy}-${mm}-${dd}-${opts.slug}.md`;
+
+    const sessionsDir = path.join(memoryDir, "sessions");
+    const filePath = path.join(sessionsDir, filename);
+
+    // Ensure sessions directory exists
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    // Write the session file
+    fs.writeFileSync(filePath, content, "utf-8");
+    console.log(`Saved session: ${filePath}`);
+
+    // Re-index
+    const state = openDatabase();
+    const provider = createEmbeddingProvider();
+
+    try {
+      console.log("Indexing memory files...");
+      const result = await indexMemoryFiles(state, provider, memoryDir);
+
+      console.log("");
+      console.log(`Files scanned:        ${result.filesScanned}`);
+      console.log(`Files changed:        ${result.filesChanged}`);
+      console.log(`Chunks indexed:       ${result.chunksIndexed}`);
+      console.log(`Embeddings generated: ${result.embeddingsGenerated}`);
+      console.log(`Embeddings cached:    ${result.embeddingsCached}`);
+      console.log("");
+      console.log("Done.");
+    } finally {
+      provider.dispose();
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// update-memory command
+// ---------------------------------------------------------------------------
+
+program
+  .command("update-memory")
+  .description("Overwrite MEMORY.md with new curated content and re-index")
+  .option("--content <content>", "New MEMORY.md content (if omitted, reads from stdin)")
+  .option("--memory-dir <path>", "Override memory directory path")
+  .action(async (opts: { content?: string; memoryDir?: string }) => {
+    const memoryDir = opts.memoryDir ?? getMemoryDir();
+
+    // Resolve content from --content flag or stdin
+    let content: string;
+    if (opts.content != null) {
+      content = opts.content;
+    } else {
+      if (process.stdin.isTTY) {
+        console.error(
+          "Error: No content provided. Use --content <string> or pipe content via stdin.",
+        );
+        process.exit(1);
+      }
+      content = await readStdin();
+    }
+
+    const filePath = path.join(memoryDir, "MEMORY.md");
+
+    // Ensure memory directory exists
+    fs.mkdirSync(memoryDir, { recursive: true });
+
+    // Write MEMORY.md
+    fs.writeFileSync(filePath, content, "utf-8");
+    console.log(`Updated memory: ${filePath}`);
+
+    // Re-index
+    const state = openDatabase();
+    const provider = createEmbeddingProvider();
+
+    try {
+      console.log("Indexing memory files...");
+      const result = await indexMemoryFiles(state, provider, memoryDir);
+
+      console.log("");
+      console.log(`Files scanned:        ${result.filesScanned}`);
+      console.log(`Files changed:        ${result.filesChanged}`);
+      console.log(`Chunks indexed:       ${result.chunksIndexed}`);
+      console.log(`Embeddings generated: ${result.embeddingsGenerated}`);
+      console.log(`Embeddings cached:    ${result.embeddingsCached}`);
+      console.log("");
+      console.log("Done.");
+    } finally {
+      provider.dispose();
       closeDatabase(state);
     }
   });

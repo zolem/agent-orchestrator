@@ -45,7 +45,7 @@ Task({
 ```
 Task({
   subagent_type: "generalPurpose",
-  prompt: "You are the memory curator agent. Your job is to distill a session log into MEMORY.md.\n\n1. Read the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md\n2. Read the current ~/.config/agent-orchestrator/memory/MEMORY.md\n3. Extract new preferences, patterns, lessons, and anti-patterns from the session\n4. Update MEMORY.md with the new information (merge, don't replace)\n5. Keep MEMORY.md concise — distill, don't copy verbatim",
+  prompt: "You are the memory curator agent. Your job is to distill a session log into MEMORY.md.\n\n1. Read the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md\n2. Read the current ~/.config/agent-orchestrator/memory/MEMORY.md\n3. Extract new preferences, patterns, lessons, and anti-patterns from the session\n4. Prepare the updated MEMORY.md content (merge new info, don't replace wholesale)\n5. Keep MEMORY.md concise — distill, don't copy verbatim\n6. Write the updated content using: memory-search update-memory --content \"<updated content>\"",
   description: "Curate session into memory"
 })
 ```

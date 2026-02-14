@@ -37,7 +37,8 @@ The user's request: <paste or summarize the user's request here>. Project: <proj
 ### Example: Invoking the memory-agent
 
 ```
-Use the memory-agent to update ~/.config/agent-orchestrator/memory/MEMORY.md based on the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md
+Use the memory-agent to curate ~/.config/agent-orchestrator/memory/MEMORY.md based on the session log at ~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md. 
+Use `memory-search update-memory --content "<updated content>"` to write the updated MEMORY.md (this also re-indexes automatically).
 ```
 
 ### Example: Creating and invoking a dynamic agent

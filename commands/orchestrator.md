@@ -124,10 +124,9 @@ Project: <project name>
 4. Note what's working and what's not
 
 **Session End:**
-5. Write raw session log to `<memory-dir>/sessions/`
-6. Invoke `memory-agent` to curate the session log into `MEMORY.md` (handles upserts, dedup, pruning)
-7. Run `memory-search index` to refresh the search index with new session log and updated MEMORY.md
-8. Clean up one-off dynamic agents (keep effective ones)
+5. Run `memory-search save-session` to write the raw session log and re-index automatically
+6. Invoke `memory-agent` to curate the session log into `MEMORY.md` using `memory-search update-memory`
+7. Clean up one-off dynamic agents (keep effective ones)
 
 ### Memory Update Semantics
 
@@ -152,6 +151,8 @@ The `memory-search` CLI provides semantic recall across all memory files, includ
 | `memory-search query "<text>"` | Semantic search. Returns ranked results with file paths, line numbers, snippets, and scores. |
 | `memory-search query "<text>" --json` | Same as above but outputs JSON (useful for programmatic consumption). |
 | `memory-search status` | Show index statistics (files, chunks, cache size, model info). |
+| `memory-search save-session --slug "<slug>"` | Save a session log to `<memory-dir>/sessions/YYYY-MM-DD-<slug>.md` and re-index. Pass content via `--content` or stdin. |
+| `memory-search update-memory` | Overwrite MEMORY.md with new content and re-index. Pass content via `--content` or stdin. |
 
 **When to use `memory-search query` directly (ad-hoc, during a session):**
 - When the user references something from a past interaction that wasn't covered in the recall briefing
@@ -324,17 +325,17 @@ Only after explicit approval:
 
 ### Step 7: Session End (Memory Update)
 
-1. **Write session log**: Create `<memory-dir>/sessions/YYYY-MM-DD-<slug>.md` with:
+1. **Save session log**: Run `memory-search save-session --slug "<slug>"` with the session content via `--content` or stdin. This writes the log to `<memory-dir>/sessions/YYYY-MM-DD-<slug>.md` and automatically re-indexes.
+   
+   The session content should include:
    - Task summary and outcome
    - Sub-agents used and their performance
    - User feedback received
    - Raw notes on what worked/failed
 
-2. **Invoke memory-agent**: Delegate the curation work (see harness-specific invocation syntax).
+2. **Invoke memory-agent**: Delegate the curation work (see harness-specific invocation syntax). The memory-agent should use `memory-search update-memory` to write the updated MEMORY.md (this also re-indexes automatically).
 
-3. **Refresh search index**: Run `memory-search index` to make the new session log and updated MEMORY.md searchable in future sessions.
-
-4. **Clean up dynamic agents**: Delete agent files in the dynamic agents directory that won't be reused (keep effective ones for future sessions)
+3. **Clean up dynamic agents**: Delete agent files in the dynamic agents directory that won't be reused (keep effective ones for future sessions)
 
 ## Key Principles
 

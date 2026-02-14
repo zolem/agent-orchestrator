@@ -62,15 +62,21 @@ When a session observation contradicts an existing memory entry:
 - **Patterns/Lessons**: Keep both if they apply to different contexts, otherwise newer wins
 - **Anti-Patterns**: Only remove if there's clear evidence the anti-pattern no longer applies
 
-## Post-Write: Refresh Search Index
+## Writing MEMORY.md
 
-After updating MEMORY.md, run the search index refresh so new memories are immediately searchable:
+Use the `memory-search update-memory` CLI command to write the updated MEMORY.md content. This writes the file and automatically re-indexes the search index in one step:
 
 ```bash
-memory-search index
+memory-search update-memory --content "<full updated MEMORY.md content>"
 ```
 
-This updates the vector + keyword search index at `~/.config/agent-orchestrator/memory/.search-index.sqlite`. If the command is not available (not installed), skip this step silently — the orchestrator can still read MEMORY.md directly.
+If the content is long, you can also pipe it:
+
+```bash
+echo "<content>" | memory-search update-memory
+```
+
+If the command is not available (not installed), fall back to writing MEMORY.md directly and running `memory-search index` as a separate step.
 
 ## Output
 

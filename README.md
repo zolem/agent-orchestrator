@@ -87,6 +87,26 @@ memory-search status
 
 Shows the number of indexed files, chunks, cached embeddings, the embedding model in use, and whether FTS5 and sqlite-vec extensions are available.
 
+#### Save a session log
+
+```bash
+memory-search save-session --slug "auth-feature" --content "# Session: Auth Feature..."
+```
+
+Writes a session log to `~/.config/agent-orchestrator/memory/sessions/YYYY-MM-DD-<slug>.md` and automatically re-indexes. Content can be passed via `--content` or piped via stdin:
+
+```bash
+echo "# Session content..." | memory-search save-session --slug "auth-feature"
+```
+
+#### Update MEMORY.md
+
+```bash
+memory-search update-memory --content "# Orchestrator Memory..."
+```
+
+Overwrites `MEMORY.md` with new content and automatically re-indexes. Content can be passed via `--content` or piped via stdin.
+
 ## How Memory Works
 
 The orchestrator's memory system persists across sessions in a shared, tool-agnostic directory:
@@ -101,7 +121,7 @@ The orchestrator's memory system persists across sessions in a shared, tool-agno
 
 1. **Session start**: The orchestrator invokes the `memory-recall-agent` which reads `MEMORY.md`, searches past sessions, and delivers a unified briefing.
 2. **During the session**: The orchestrator delegates work to sub-agents, evaluates results, and refines agents as needed.
-3. **Session end**: The orchestrator writes a session log, invokes the `memory-agent` to curate learnings into `MEMORY.md`, and runs `memory-search index` to refresh the search index.
+3. **Session end**: The orchestrator runs `memory-search save-session` to write the session log (with automatic re-indexing), then invokes the `memory-agent` to curate learnings into `MEMORY.md` via `memory-search update-memory`.
 
 ### Agents
 
@@ -178,7 +198,7 @@ The build uses [esbuild](https://esbuild.github.io/) to bundle all TypeScript so
 ```
 agent-orchestrator/
   src/              TypeScript source (not published to npm)
-    cli.ts          CLI entry point and command definitions
+    cli.ts          CLI entry point (index, query, status, save-session, update-memory, uninstall)
     db.ts           SQLite schema and database management
     indexer.ts      Delta-based file indexing
     search.ts       Hybrid BM25 + vector search
