@@ -146,19 +146,28 @@ for (const platform of platforms) {
 
   if (platform === "cursor") {
     // Cursor hooks.json
+    // Cursor's stop hook does NOT provide transcript_path or response text.
+    // Instead we use:
+    //   - sessionStart: init conversation file + inject context
+    //   - beforeSubmitPrompt: buffer the user prompt (has `prompt` field)
+    //   - afterAgentResponse: capture assistant response (has `text` field)
+    //   - sessionEnd: finalize conversation file
     const hooksConfig = {
       version: 1,
       hooks: {
         sessionStart: [
           {
-            command:
-              "memory-search hook-start --platform cursor --cwd $WORKSPACE_ROOT",
+            command: "memory-search hook-start --platform cursor",
           },
         ],
-        stop: [
+        beforeSubmitPrompt: [
           {
-            command:
-              "memory-search hook-stop --transcript-path $TRANSCRIPT_PATH",
+            command: "memory-search hook-prompt",
+          },
+        ],
+        afterAgentResponse: [
+          {
+            command: "memory-search hook-stop",
           },
         ],
         sessionEnd: [
@@ -181,8 +190,7 @@ for (const platform of platforms) {
             hooks: [
               {
                 type: "command",
-                command:
-                  "memory-search hook-start --platform claude-code --cwd $PWD",
+                command: "memory-search hook-start --platform claude-code",
               },
             ],
           },
@@ -194,17 +202,6 @@ for (const platform of platforms) {
                 type: "command",
                 command: "memory-search hook-stop",
                 async: true,
-              },
-            ],
-          },
-        ],
-        UserPromptSubmit: [
-          {
-            hooks: [
-              {
-                type: "command",
-                command:
-                  "memory-search hook-start --platform claude-code --cwd $PWD --no-inference",
               },
             ],
           },

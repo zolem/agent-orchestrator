@@ -42,6 +42,96 @@ function getConversationPath(sessionId: string): string {
   return path.join(getConversationsDir(), `${sessionId}.md`);
 }
 
+function getSessionMapDir(): string {
+  return path.join(getMemoryDir(), ".session-map");
+}
+
+/**
+ * Save a mapping from a platform's session ID to our memory session ID.
+ * Used for Claude Code where env vars may not persist across hooks.
+ */
+export function saveSessionMapping(platformSessionId: string, memorySessionId: string): void {
+  const dir = getSessionMapDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, platformSessionId), memorySessionId, "utf-8");
+}
+
+/**
+ * Look up a memory session ID from a platform session ID.
+ */
+export function lookupSessionMapping(platformSessionId: string): string | null {
+  try {
+    const filePath = path.join(getSessionMapDir(), platformSessionId);
+    if (!fs.existsSync(filePath)) return null;
+    return fs.readFileSync(filePath, "utf-8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clean up a session mapping file.
+ */
+export function removeSessionMapping(platformSessionId: string): void {
+  try {
+    const filePath = path.join(getSessionMapDir(), platformSessionId);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Non-blocking
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pending prompt buffer (Cursor-specific)
+// ---------------------------------------------------------------------------
+
+/**
+ * Directory for storing pending user prompts between beforeSubmitPrompt
+ * and afterAgentResponse hooks in Cursor (which doesn't provide
+ * transcript_path).
+ */
+function getPendingPromptDir(): string {
+  return path.join(getMemoryDir(), ".pending-prompts");
+}
+
+/**
+ * Store a user prompt for later pairing with the agent response.
+ * Key is the Cursor conversation_id.
+ */
+export function savePendingPrompt(conversationId: string, prompt: string): void {
+  const dir = getPendingPromptDir();
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, conversationId), prompt, "utf-8");
+}
+
+/**
+ * Retrieve and remove a pending user prompt.
+ * Returns null if no pending prompt exists.
+ */
+export function consumePendingPrompt(conversationId: string): string | null {
+  try {
+    const filePath = path.join(getPendingPromptDir(), conversationId);
+    if (!fs.existsSync(filePath)) return null;
+    const prompt = fs.readFileSync(filePath, "utf-8");
+    fs.unlinkSync(filePath);
+    return prompt;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clean up any leftover pending prompts for a conversation.
+ */
+export function removePendingPrompt(conversationId: string): void {
+  try {
+    const filePath = path.join(getPendingPromptDir(), conversationId);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // Non-blocking
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -308,8 +398,192 @@ export function readAllTurnsFromTranscript(
 // ---------------------------------------------------------------------------
 
 /**
+ * Metadata extracted from hook stdin JSON.
+ * Works for both Cursor and Claude Code hook events.
+ *
+ * Cursor uses `conversation_id`; Claude Code uses `session_id`.
+ * Claude Code provides `transcript_path`; Cursor's afterAgentResponse
+ * provides `text` (assistant response), and beforeSubmitPrompt provides
+ * `prompt` (user message).
+ */
+export interface HookInput {
+  /** Claude Code's session_id or Cursor's conversation_id (normalized) */
+  session_id?: string;
+  transcript_path?: string;
+  cwd?: string;
+  hook_event_name?: string;
+  /** Cursor afterAgentResponse: the agent's response text */
+  text?: string;
+  /** Cursor beforeSubmitPrompt: the user's prompt text */
+  prompt?: string;
+  /** Cursor stop: task status (completed/aborted/error) */
+  status?: string;
+}
+
+/**
+ * Parse hook stdin JSON to extract metadata.
+ * Handles both Cursor and Claude Code field names.
+ */
+export function parseStopHookInput(input: string): HookInput | null {
+  try {
+    const data = JSON.parse(input) as Record<string, unknown>;
+    // Normalize: Claude Code uses session_id, Cursor uses conversation_id
+    const sessionId =
+      (typeof data.session_id === "string" ? data.session_id : undefined) ??
+      (typeof data.conversation_id === "string" ? data.conversation_id : undefined);
+    return {
+      session_id: sessionId,
+      transcript_path: typeof data.transcript_path === "string" ? data.transcript_path : undefined,
+      cwd: typeof data.cwd === "string" ? data.cwd : undefined,
+      hook_event_name: typeof data.hook_event_name === "string" ? data.hook_event_name : undefined,
+      text: typeof data.text === "string" ? data.text : undefined,
+      prompt: typeof data.prompt === "string" ? data.prompt : undefined,
+      status: typeof data.status === "string" ? data.status : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code JSONL transcript reading
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract text content from a Claude Code message content field.
+ * Content can be a string or an array of content blocks.
+ */
+function extractTextContent(
+  content: unknown,
+): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      (block as Record<string, unknown>).type === "text" &&
+      "text" in block
+    ) {
+      parts.push((block as Record<string, unknown>).text as string);
+    }
+  }
+  return parts.join("\n");
+}
+
+/**
+ * Read a Claude Code JSONL transcript file and extract the latest
+ * user/assistant turn pair.
+ *
+ * Transcript lines have a `type` field: "user" messages contain
+ * `.message.content` (string), while "assistant" messages contain
+ * `.message.content` (array of {type:"text", text:string} blocks).
+ */
+export function readLatestTurnFromClaudeTranscript(
+  transcriptPath: string,
+): ConversationTurn | null {
+  try {
+    if (!fs.existsSync(transcriptPath)) return null;
+    const raw = fs.readFileSync(transcriptPath, "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+
+    // Walk backwards to find the last user/assistant pair
+    let lastUser: string | undefined;
+    let lastAssistant: string | undefined;
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i] ?? "") as Record<string, unknown>;
+        const entryType = entry.type as string | undefined;
+
+        if (entryType === "assistant" && !lastAssistant) {
+          const msg = entry.message as Record<string, unknown> | undefined;
+          if (msg?.content) {
+            const text = extractTextContent(msg.content);
+            if (text.trim()) lastAssistant = text;
+          }
+        } else if (entryType === "user" && !lastUser) {
+          const msg = entry.message as Record<string, unknown> | undefined;
+          if (msg?.content) {
+            const text = extractTextContent(msg.content);
+            if (text.trim()) lastUser = text;
+          }
+        }
+
+        if (lastUser && lastAssistant) break;
+      } catch {
+        // Skip malformed lines
+      }
+    }
+
+    if (!lastUser && !lastAssistant) return null;
+    return { user: lastUser, assistant: lastAssistant };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read all user/assistant turns from a Claude Code JSONL transcript file.
+ */
+export function readAllTurnsFromClaudeTranscript(
+  transcriptPath: string,
+): ConversationTurn[] {
+  try {
+    if (!fs.existsSync(transcriptPath)) return [];
+    const raw = fs.readFileSync(transcriptPath, "utf-8");
+    const lines = raw.split("\n").filter(Boolean);
+
+    const turns: ConversationTurn[] = [];
+    let currentUser: string | undefined;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        const entryType = entry.type as string | undefined;
+
+        if (entryType === "user") {
+          const msg = entry.message as Record<string, unknown> | undefined;
+          const text = msg?.content ? extractTextContent(msg.content) : "";
+          if (currentUser) {
+            turns.push({ user: currentUser });
+          }
+          currentUser = text.trim() || undefined;
+        } else if (entryType === "assistant") {
+          const msg = entry.message as Record<string, unknown> | undefined;
+          const text = msg?.content ? extractTextContent(msg.content) : "";
+          if (text.trim()) {
+            turns.push({ user: currentUser, assistant: text });
+            currentUser = undefined;
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+
+    if (currentUser) {
+      turns.push({ user: currentUser });
+    }
+
+    return turns;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Parse a turn from Claude Code hook input (JSON from stdin).
- * The stop hook receives the conversation context.
+ *
+ * The Stop hook receives { session_id, transcript_path, cwd, ... } — NOT a
+ * conversation array.  We parse the metadata here; the actual transcript is
+ * read separately via readLatestTurnFromClaudeTranscript().
+ *
+ * This function is kept for backward-compatibility with any callers that
+ * might pipe a conversation array directly.
  */
 export function parseTurnFromStdin(
   input: string,
@@ -317,14 +591,13 @@ export function parseTurnFromStdin(
   try {
     const data = JSON.parse(input) as Record<string, unknown>;
 
-    // Claude Code stop hook provides conversation context
+    // Legacy path: if a conversation array is provided directly
     if (data.conversation && Array.isArray(data.conversation)) {
       const messages = data.conversation as Array<{
         role: string;
         content: string;
       }>;
 
-      // Get the last user/assistant pair
       let lastUser: string | undefined;
       let lastAssistant: string | undefined;
 
@@ -344,6 +617,11 @@ export function parseTurnFromStdin(
       if (lastUser || lastAssistant) {
         return { user: lastUser, assistant: lastAssistant };
       }
+    }
+
+    // If the hook provides a transcript_path, read from the JSONL file
+    if (data.transcript_path && typeof data.transcript_path === "string") {
+      return readLatestTurnFromClaudeTranscript(data.transcript_path);
     }
 
     // Fallback: check for direct user/assistant fields

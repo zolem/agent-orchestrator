@@ -584,9 +584,35 @@ program
     platform?: string;
     inference?: boolean;
   }) => {
-    const cwd = opts.cwd ?? process.cwd();
     const platform = opts.platform ?? "cursor";
     const useInference = opts.inference !== false;
+
+    // Both Cursor and Claude Code send hook input as JSON on stdin.
+    // Read it to get the platform's session/conversation ID for mapping.
+    let platformSessionId: string | undefined;
+    let stdinCwd: string | undefined;
+    if (!process.stdin.isTTY) {
+      try {
+        const stdinContent = await readStdin();
+        if (stdinContent.trim()) {
+          const parsed = JSON.parse(stdinContent) as Record<string, unknown>;
+          // Claude Code uses "session_id", Cursor uses "conversation_id"
+          if (typeof parsed.session_id === "string") {
+            platformSessionId = parsed.session_id;
+          } else if (typeof parsed.conversation_id === "string") {
+            platformSessionId = parsed.conversation_id;
+          }
+          // Both may provide cwd
+          if (typeof parsed.cwd === "string") {
+            stdinCwd = parsed.cwd;
+          }
+        }
+      } catch {
+        // Non-blocking
+      }
+    }
+
+    const cwd = opts.cwd || stdinCwd || process.env.CURSOR_PROJECT_DIR || process.cwd();
 
     // 1. Detect project
     let projectName = opts.project;
@@ -595,8 +621,14 @@ program
     }
 
     // 2. Generate session ID
-    const { generateSessionId, initConversation } = await import("./conversation.js");
+    const { generateSessionId, initConversation, saveSessionMapping } = await import("./conversation.js");
     const sessionId = generateSessionId();
+
+    // Save mapping from platform session/conversation ID to our memory session ID.
+    // This lets hook-stop and hook-end resolve back to our session ID.
+    if (platformSessionId) {
+      saveSessionMapping(platformSessionId, sessionId);
+    }
 
     // Init conversation file
     initConversation({
@@ -677,6 +709,19 @@ program
 
       // 6. Output JSON to stdout
       if (platform === "claude-code") {
+        // Persist session ID for subsequent hooks via CLAUDE_ENV_FILE
+        const envFile = process.env.CLAUDE_ENV_FILE;
+        if (envFile) {
+          try {
+            fs.appendFileSync(
+              envFile,
+              `export MEMORY_SESSION_ID=${sessionId}\nexport MEMORY_PROJECT=${projectName}\n`,
+            );
+          } catch {
+            // Non-blocking: env file write may fail in some environments
+          }
+        }
+
         const output = {
           hookSpecificOutput: {
             hookEventName: "SessionStart",
@@ -701,13 +746,39 @@ program
   });
 
 // ---------------------------------------------------------------------------
-// hook-stop command — stop/afterAgentResponse hook
+// hook-prompt command — beforeSubmitPrompt hook (Cursor only)
+// ---------------------------------------------------------------------------
+
+program
+  .command("hook-prompt")
+  .description("beforeSubmitPrompt hook: buffer the user prompt for pairing with afterAgentResponse (Cursor)")
+  .action(async () => {
+    if (process.stdin.isTTY) return;
+
+    const stdinContent = await readStdin();
+    if (!stdinContent.trim()) return;
+
+    const {
+      parseStopHookInput,
+      savePendingPrompt,
+    } = await import("./conversation.js");
+
+    const hookInput = parseStopHookInput(stdinContent);
+    if (!hookInput?.session_id || !hookInput.prompt) return;
+
+    // Store the prompt keyed by the platform conversation_id so
+    // afterAgentResponse can retrieve it.
+    savePendingPrompt(hookInput.session_id, hookInput.prompt);
+  });
+
+// ---------------------------------------------------------------------------
+// hook-stop command — afterAgentResponse (Cursor) / Stop (Claude Code)
 // ---------------------------------------------------------------------------
 
 program
   .command("hook-stop")
   .description("Stop hook: capture turn, extract beliefs, re-index (async)")
-  .option("--transcript-path <path>", "Path to Cursor transcript file")
+  .option("--transcript-path <path>", "Path to transcript file (deprecated: now read from stdin JSON)")
   .option("--session-id <id>", "Session ID (or reads from MEMORY_SESSION_ID env)")
   .option("--project <name>", "Project name (or reads from MEMORY_PROJECT env)")
   .option("--no-inference", "Skip LLM belief extraction")
@@ -717,43 +788,79 @@ program
     project?: string;
     inference?: boolean;
   }) => {
-    const sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
+    let sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
     const projectName = opts.project ?? process.env.MEMORY_PROJECT ?? detectProjectFromGit() ?? "unknown";
     const useInference = opts.inference !== false;
 
-    if (!sessionId) {
-      // No session ID means we can't track this turn
-      return;
-    }
+    const {
+      appendTurn,
+      readLatestTurnFromTranscript,
+      parseStopHookInput,
+      readLatestTurnFromClaudeTranscript,
+      lookupSessionMapping,
+      consumePendingPrompt,
+    } = await import("./conversation.js");
 
-    const { appendTurn, readLatestTurnFromTranscript, parseTurnFromStdin } =
-      await import("./conversation.js");
-
-    // 1. Get the latest turn
+    // 1. Read stdin JSON (both Cursor and Claude Code send hook input on stdin)
     let turn: import("./conversation.js").ConversationTurn | null = null;
+    let transcriptPath = opts.transcriptPath || undefined;
+    let platformSessionId: string | undefined;
 
-    if (opts.transcriptPath) {
-      // Cursor: read from transcript file
-      turn = readLatestTurnFromTranscript(opts.transcriptPath);
-    } else if (!process.stdin.isTTY) {
-      // Claude Code or piped input: read from stdin
+    if (!process.stdin.isTTY) {
       const stdinContent = await readStdin();
       if (stdinContent.trim()) {
-        turn = parseTurnFromStdin(stdinContent);
+        const hookInput = parseStopHookInput(stdinContent);
+
+        platformSessionId = hookInput?.session_id;
+
+        // Extract transcript_path from stdin (Claude Code provides this)
+        if (hookInput?.transcript_path) {
+          transcriptPath = hookInput.transcript_path;
+        }
+
+        // Resolve session ID: env var > CLI flag > session mapping
+        if (!sessionId && platformSessionId) {
+          const mapped = lookupSessionMapping(platformSessionId);
+          if (mapped) {
+            sessionId = mapped;
+          }
+        }
+
+        // Cursor path: afterAgentResponse provides `text` (assistant response).
+        // Pair it with the buffered user prompt from beforeSubmitPrompt.
+        if (hookInput?.text && platformSessionId) {
+          const pendingPrompt = consumePendingPrompt(platformSessionId);
+          turn = {
+            user: pendingPrompt ?? undefined,
+            assistant: hookInput.text,
+          };
+        }
       }
+    }
+
+    // 2. If no turn yet, try reading from the transcript file (Claude Code path)
+    if (!turn && transcriptPath) {
+      turn = readLatestTurnFromClaudeTranscript(transcriptPath);
+      if (!turn) {
+        turn = readLatestTurnFromTranscript(transcriptPath);
+      }
+    }
+
+    if (!sessionId) {
+      return;
     }
 
     if (!turn) {
       return;
     }
 
-    // 2. Append turn to conversation file
+    // 3. Append turn to conversation file
     appendTurn(sessionId, turn, {
       project: projectName,
       cwd: process.cwd(),
     });
 
-    // 3. Re-index
+    // 4. Re-index
     try {
       const memoryDir = getMemoryDir();
       const state = await openDatabase();
@@ -769,7 +876,7 @@ program
       // Non-blocking: don't fail the hook if indexing fails
     }
 
-    // 4. Extract beliefs from the turn (if inference enabled)
+    // 5. Extract beliefs from the turn (if inference enabled)
     if (useInference) {
       try {
         const { createInferenceProvider } = await import("./inference.js");
@@ -814,7 +921,32 @@ program
   .description("Session end hook: finalize conversation file, final re-index")
   .option("--session-id <id>", "Session ID (or reads from MEMORY_SESSION_ID env)")
   .action(async (opts: { sessionId?: string }) => {
-    const sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
+    let sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
+
+    // Both Cursor and Claude Code send JSON on stdin with session/conversation ID.
+    // Resolve to our memory session ID via the session mapping.
+    if (!sessionId && !process.stdin.isTTY) {
+      try {
+        const stdinContent = await readStdin();
+        if (stdinContent.trim()) {
+          const { parseStopHookInput, lookupSessionMapping, removeSessionMapping } =
+            await import("./conversation.js");
+          const hookInput = parseStopHookInput(stdinContent);
+          // Try session_id (Claude Code) then conversation_id (Cursor)
+          const platformId = hookInput?.session_id;
+          if (platformId) {
+            const mapped = lookupSessionMapping(platformId);
+            if (mapped) {
+              sessionId = mapped;
+              // Clean up the mapping file since the session is ending
+              removeSessionMapping(platformId);
+            }
+          }
+        }
+      } catch {
+        // Non-blocking
+      }
+    }
 
     if (!sessionId) {
       return;
