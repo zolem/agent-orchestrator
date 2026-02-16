@@ -44,6 +44,15 @@ function extractFileMetadata(relPath: string, content: string): FileMetadata {
     if (dateMatch) {
       metadata.date = dateMatch[1];
     }
+  } else if (relPath.startsWith("conversations/")) {
+    metadata.fileType = "session-log";
+
+    // Extract date from filename: conversations/YYYYMMDD-HHMMSS-xxxx.md
+    const filename = path.basename(relPath, ".md");
+    const dateMatch = filename.match(/^(\d{4})(\d{2})(\d{2})/);
+    if (dateMatch) {
+      metadata.date = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
+    }
   } else if (relPath.toLowerCase() === "memory.md") {
     metadata.fileType = "memory";
   }
@@ -139,6 +148,10 @@ export function listMemoryFiles(memoryDir: string): string[] {
   // sessions/ directory
   const sessionsDir = path.join(memoryDir, "sessions");
   walkDir(sessionsDir, result);
+
+  // conversations/ directory (hook-captured conversation files)
+  const conversationsDir = path.join(memoryDir, "conversations");
+  walkDir(conversationsDir, result);
 
   // Deduplicate by lowercase resolved path (handles case-insensitive filesystems)
   const seen = new Set<string>();

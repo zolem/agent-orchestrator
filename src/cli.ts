@@ -1,13 +1,23 @@
 /**
  * cli.ts — CLI entry point for memory-search.
  *
- * Commands:
+ * Core commands:
  *   memory-search index          — Index/re-index memory files
  *   memory-search query          — Hybrid search over indexed memories
  *   memory-search status         — Show index statistics
+ *
+ * Hook commands (invoked by Cursor/Claude Code hooks):
+ *   memory-search hook-start     — Session start: inject context + workflow instructions
+ *   memory-search hook-stop      — After agent response: capture turn, extract beliefs
+ *   memory-search hook-end       — Session end: finalize conversation file
+ *
+ * Legacy commands (kept for backward compatibility):
  *   memory-search save-session   — Write a session log file and re-index
  *   memory-search update-memory  — Overwrite MEMORY.md and re-index
- *   memory-search uninstall      — Remove all installed files and optionally delete data
+ *   memory-search uninstall      — Remove all installed files
+ *
+ * Migration:
+ *   memory-search migrate        — Migrate old node types to belief_node
  */
 
 import { Command } from "commander";
@@ -373,61 +383,39 @@ program
 
 program
   .command("uninstall")
-  .description("Remove all installed orchestrator files and uninstall the package")
+  .description("Remove all installed hook configs and uninstall the package")
   .action(async () => {
     const home = os.homedir();
     const configDir = getConfigDir();
     const cursorDir = path.join(home, ".cursor");
     const claudeDir = path.join(home, ".claude");
 
-    // Files/symlinks the postinstall created (for each platform)
-    const installedFiles: string[] = [];
-    const installedSymlinks: string[] = [];
+    console.log("This will remove agent-orchestrator hooks from:\n");
 
-    // Cursor files
-    if (fs.existsSync(cursorDir)) {
-      installedFiles.push(
-        path.join(cursorDir, "commands", "orchestrator.md"),
-        path.join(cursorDir, "agents", "memory-agent.md"),
-        path.join(cursorDir, "agents", "memory-recall-agent.md"),
-      );
-      installedSymlinks.push(path.join(cursorDir, "agents", "dynamic"));
+    // Describe what will be cleaned
+    const cursorHooksPath = path.join(cursorDir, "hooks.json");
+    const claudeSettingsPath = path.join(claudeDir, "settings.json");
+
+    if (fs.existsSync(cursorHooksPath)) {
+      console.log(`  ${cursorHooksPath} (remove memory-search hooks)`);
+    }
+    if (fs.existsSync(claudeSettingsPath)) {
+      console.log(`  ${claudeSettingsPath} (remove memory-search hooks)`);
     }
 
-    // Claude Code files
-    if (fs.existsSync(claudeDir)) {
-      installedFiles.push(
-        path.join(claudeDir, "skills", "orchestrator", "SKILL.md"),
-        path.join(claudeDir, "agents", "memory-agent.md"),
-        path.join(claudeDir, "agents", "memory-recall-agent.md"),
-      );
-      installedSymlinks.push(path.join(claudeDir, "agents", "dynamic"));
-    }
-
-    // Directories created by postinstall (only removed if empty)
-    const installedDirs = [
-      path.join(claudeDir, "skills", "orchestrator"),
+    // Also clean up legacy v1 files if they still exist
+    const legacyFiles = [
+      path.join(cursorDir, "commands", "orchestrator.md"),
+      path.join(cursorDir, "agents", "memory-agent.md"),
+      path.join(cursorDir, "agents", "memory-recall-agent.md"),
+      path.join(claudeDir, "skills", "orchestrator", "SKILL.md"),
+      path.join(claudeDir, "agents", "memory-agent.md"),
+      path.join(claudeDir, "agents", "memory-recall-agent.md"),
     ];
 
-    console.log("This will remove:\n");
-
-    for (const file of installedFiles) {
+    for (const file of legacyFiles) {
       if (fs.existsSync(file)) {
-        console.log(`  ${file}`);
-      }
-    }
-    for (const link of installedSymlinks) {
-      try {
-        if (fs.lstatSync(link).isSymbolicLink()) {
-          console.log(`  ${link} (symlink)`);
-        }
-      } catch {
-        // doesn't exist
-      }
-    }
-    for (const dir of installedDirs) {
-      if (fs.existsSync(dir)) {
-        console.log(`  ${dir}/ (if empty)`);
+        console.log(`  ${file} (legacy v1 file)`);
       }
     }
 
@@ -444,8 +432,8 @@ program
 
     const dataAnswer = await ask(
       `Do you want to delete your shared data at ${configDir}?\n` +
-      "  This includes MEMORY.md, session logs, the search index, and the\n" +
-      "  downloaded embedding model (~0.6GB).\n\n" +
+      "  This includes conversations, beliefs, session logs, the search\n" +
+      "  index, and the downloaded models (~2.6GB).\n\n" +
       "  [k]eep data for later  /  [d]elete everything: ",
     );
 
@@ -454,8 +442,77 @@ program
     rl.close();
     console.log("");
 
-    // Remove installed files
-    for (const file of installedFiles) {
+    // Remove memory-search hooks from Cursor hooks.json
+    if (fs.existsSync(cursorHooksPath)) {
+      try {
+        const hooksConfig = JSON.parse(fs.readFileSync(cursorHooksPath, "utf-8"));
+        if (hooksConfig.hooks) {
+          for (const event of Object.keys(hooksConfig.hooks)) {
+            if (Array.isArray(hooksConfig.hooks[event])) {
+              hooksConfig.hooks[event] = hooksConfig.hooks[event].filter(
+                (h: { command?: string }) =>
+                  !h.command?.includes("memory-search"),
+              );
+              if (hooksConfig.hooks[event].length === 0) {
+                delete hooksConfig.hooks[event];
+              }
+            }
+          }
+          if (Object.keys(hooksConfig.hooks).length === 0) {
+            delete hooksConfig.hooks;
+          }
+        }
+        // If the file is now effectively empty, remove it; otherwise update
+        if (Object.keys(hooksConfig).length === 0 || (Object.keys(hooksConfig).length === 1 && hooksConfig.version)) {
+          fs.unlinkSync(cursorHooksPath);
+          console.log(`  Removed: ${cursorHooksPath}`);
+        } else {
+          fs.writeFileSync(cursorHooksPath, JSON.stringify(hooksConfig, null, 2) + "\n", "utf-8");
+          console.log(`  Updated: ${cursorHooksPath} (removed memory-search hooks)`);
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`  Warning: could not update ${cursorHooksPath}: ${msg}`);
+      }
+    }
+
+    // Remove memory-search hooks from Claude Code settings.json
+    if (fs.existsSync(claudeSettingsPath)) {
+      try {
+        const settings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf-8"));
+        if (settings.hooks) {
+          for (const event of Object.keys(settings.hooks)) {
+            if (Array.isArray(settings.hooks[event])) {
+              settings.hooks[event] = settings.hooks[event].filter(
+                (entry: { hooks?: Array<{ command?: string }> }) => {
+                  if (entry.hooks) {
+                    entry.hooks = entry.hooks.filter(
+                      (h) => !h.command?.includes("memory-search"),
+                    );
+                    return entry.hooks.length > 0;
+                  }
+                  return true;
+                },
+              );
+              if (settings.hooks[event].length === 0) {
+                delete settings.hooks[event];
+              }
+            }
+          }
+          if (Object.keys(settings.hooks).length === 0) {
+            delete settings.hooks;
+          }
+        }
+        fs.writeFileSync(claudeSettingsPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+        console.log(`  Updated: ${claudeSettingsPath} (removed memory-search hooks)`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`  Warning: could not update ${claudeSettingsPath}: ${msg}`);
+      }
+    }
+
+    // Remove legacy v1 files
+    for (const file of legacyFiles) {
       try {
         if (fs.existsSync(file)) {
           fs.unlinkSync(file);
@@ -467,8 +524,11 @@ program
       }
     }
 
-    // Remove symlinks
-    for (const link of installedSymlinks) {
+    // Remove legacy symlinks
+    for (const link of [
+      path.join(cursorDir, "agents", "dynamic"),
+      path.join(claudeDir, "agents", "dynamic"),
+    ]) {
       try {
         const stats = fs.lstatSync(link);
         if (stats.isSymbolicLink()) {
@@ -476,25 +536,7 @@ program
           console.log(`  Removed: ${link} (symlink)`);
         }
       } catch {
-        // doesn't exist, skip
-      }
-    }
-
-    // Remove empty directories
-    for (const dir of installedDirs) {
-      try {
-        if (fs.existsSync(dir)) {
-          const entries = fs.readdirSync(dir);
-          if (entries.length === 0) {
-            fs.rmdirSync(dir);
-            console.log(`  Removed: ${dir}/`);
-          } else {
-            console.log(`  Skipped: ${dir}/ (not empty)`);
-          }
-        }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`  Warning: could not remove ${dir}: ${msg}`);
+        // doesn't exist
       }
     }
 
@@ -526,6 +568,305 @@ program
   });
 
 // ---------------------------------------------------------------------------
+// hook-start command — sessionStart hook
+// ---------------------------------------------------------------------------
+
+program
+  .command("hook-start")
+  .description("Session start hook: inject context + workflow instructions via additional_context")
+  .option("--project <name>", "Project name (auto-detected from git if omitted)")
+  .option("--cwd <path>", "Working directory (defaults to process.cwd())")
+  .option("--platform <platform>", "Platform: cursor or claude-code", "cursor")
+  .option("--no-inference", "Skip LLM synthesis, use fallback context builder")
+  .action(async (opts: {
+    project?: string;
+    cwd?: string;
+    platform?: string;
+    inference?: boolean;
+  }) => {
+    const cwd = opts.cwd ?? process.cwd();
+    const platform = opts.platform ?? "cursor";
+    const useInference = opts.inference !== false;
+
+    // 1. Detect project
+    let projectName = opts.project;
+    if (!projectName) {
+      projectName = detectProjectFromGit(cwd) ?? path.basename(cwd);
+    }
+
+    // 2. Generate session ID
+    const { generateSessionId, initConversation } = await import("./conversation.js");
+    const sessionId = generateSessionId();
+
+    // Init conversation file
+    initConversation({
+      sessionId,
+      project: projectName,
+      cwd,
+      platform: platform === "claude-code" ? "claude-code" : "cursor",
+    });
+
+    // 3. Open database and query beliefs
+    const state = await openDatabase();
+
+    try {
+      const {
+        queryWorkflowBeliefs,
+        queryBeliefs,
+      } = await import("./graph.js");
+
+      const workflowBeliefs = await queryWorkflowBeliefs(state.db, projectName);
+      const allBeliefs = await queryBeliefs(state.db, {
+        projectScope: projectName,
+        limit: 30,
+      });
+
+      // 4. Search for relevant past conversations
+      let memories: import("./search.js").SearchResult[] = [];
+      try {
+        const provider = createEmbeddingProvider();
+        try {
+          const queryText = `${projectName} recent session context`;
+          const queryVec = await provider.embed(queryText);
+          memories = await hybridSearch(state, queryVec, queryText, { maxResults: 5 });
+        } finally {
+          provider.dispose();
+        }
+      } catch {
+        // Vector search may fail if no index exists yet
+      }
+
+      // 5. Build context
+      const { WORKFLOW_BASELINE } = await import("./workflow-baseline.js");
+      let context: string;
+
+      if (useInference) {
+        try {
+          const { createInferenceProvider } = await import("./inference.js");
+          const inference = createInferenceProvider();
+          try {
+            context = await inference.synthesizeContext(
+              memories,
+              allBeliefs,
+              workflowBeliefs,
+              WORKFLOW_BASELINE,
+              { name: projectName, cwd },
+            );
+          } finally {
+            await inference.dispose();
+          }
+        } catch {
+          // LLM unavailable, use fallback
+          const { buildFallbackContext } = await import("./inference.js");
+          context = buildFallbackContext(
+            allBeliefs,
+            workflowBeliefs,
+            WORKFLOW_BASELINE,
+            { name: projectName, cwd },
+          );
+        }
+      } else {
+        const { buildFallbackContext } = await import("./inference.js");
+        context = buildFallbackContext(
+          allBeliefs,
+          workflowBeliefs,
+          WORKFLOW_BASELINE,
+          { name: projectName, cwd },
+        );
+      }
+
+      // 6. Output JSON to stdout
+      if (platform === "claude-code") {
+        const output = {
+          hookSpecificOutput: {
+            hookEventName: "SessionStart",
+            additionalContext: context,
+          },
+        };
+        console.log(JSON.stringify(output));
+      } else {
+        // Cursor format
+        const output = {
+          additional_context: context,
+          env: {
+            MEMORY_SESSION_ID: sessionId,
+            MEMORY_PROJECT: projectName,
+          },
+        };
+        console.log(JSON.stringify(output));
+      }
+    } finally {
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// hook-stop command — stop/afterAgentResponse hook
+// ---------------------------------------------------------------------------
+
+program
+  .command("hook-stop")
+  .description("Stop hook: capture turn, extract beliefs, re-index (async)")
+  .option("--transcript-path <path>", "Path to Cursor transcript file")
+  .option("--session-id <id>", "Session ID (or reads from MEMORY_SESSION_ID env)")
+  .option("--project <name>", "Project name (or reads from MEMORY_PROJECT env)")
+  .option("--no-inference", "Skip LLM belief extraction")
+  .action(async (opts: {
+    transcriptPath?: string;
+    sessionId?: string;
+    project?: string;
+    inference?: boolean;
+  }) => {
+    const sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
+    const projectName = opts.project ?? process.env.MEMORY_PROJECT ?? detectProjectFromGit() ?? "unknown";
+    const useInference = opts.inference !== false;
+
+    if (!sessionId) {
+      // No session ID means we can't track this turn
+      return;
+    }
+
+    const { appendTurn, readLatestTurnFromTranscript, parseTurnFromStdin } =
+      await import("./conversation.js");
+
+    // 1. Get the latest turn
+    let turn: import("./conversation.js").ConversationTurn | null = null;
+
+    if (opts.transcriptPath) {
+      // Cursor: read from transcript file
+      turn = readLatestTurnFromTranscript(opts.transcriptPath);
+    } else if (!process.stdin.isTTY) {
+      // Claude Code or piped input: read from stdin
+      const stdinContent = await readStdin();
+      if (stdinContent.trim()) {
+        turn = parseTurnFromStdin(stdinContent);
+      }
+    }
+
+    if (!turn) {
+      return;
+    }
+
+    // 2. Append turn to conversation file
+    appendTurn(sessionId, turn, {
+      project: projectName,
+      cwd: process.cwd(),
+    });
+
+    // 3. Re-index
+    try {
+      const memoryDir = getMemoryDir();
+      const state = await openDatabase();
+      const provider = createEmbeddingProvider();
+
+      try {
+        await indexMemoryFiles(state, provider, memoryDir);
+      } finally {
+        provider.dispose();
+        closeDatabase(state);
+      }
+    } catch {
+      // Non-blocking: don't fail the hook if indexing fails
+    }
+
+    // 4. Extract beliefs from the turn (if inference enabled)
+    if (useInference) {
+      try {
+        const { createInferenceProvider } = await import("./inference.js");
+        const { upsertBelief } = await import("./graph.js");
+
+        const turnContent = [
+          turn.user ? `User: ${turn.user}` : "",
+          turn.assistant ? `Assistant: ${turn.assistant}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        const inference = createInferenceProvider();
+        const state = await openDatabase();
+
+        try {
+          const beliefs = await inference.extractBeliefs(turnContent, projectName);
+
+          for (const belief of beliefs) {
+            await upsertBelief(
+              state.db,
+              belief,
+              `conversation:${sessionId}`,
+            );
+          }
+        } finally {
+          await inference.dispose();
+          closeDatabase(state);
+        }
+      } catch {
+        // Non-blocking: don't fail the hook if extraction fails
+      }
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// hook-end command — sessionEnd hook
+// ---------------------------------------------------------------------------
+
+program
+  .command("hook-end")
+  .description("Session end hook: finalize conversation file, final re-index")
+  .option("--session-id <id>", "Session ID (or reads from MEMORY_SESSION_ID env)")
+  .action(async (opts: { sessionId?: string }) => {
+    const sessionId = opts.sessionId ?? process.env.MEMORY_SESSION_ID;
+
+    if (!sessionId) {
+      return;
+    }
+
+    const { finalizeConversation } = await import("./conversation.js");
+
+    // 1. Finalize conversation file
+    finalizeConversation(sessionId);
+
+    // 2. Final re-index
+    try {
+      const memoryDir = getMemoryDir();
+      const state = await openDatabase();
+      const provider = createEmbeddingProvider();
+
+      try {
+        await indexMemoryFiles(state, provider, memoryDir);
+      } finally {
+        provider.dispose();
+        closeDatabase(state);
+      }
+    } catch {
+      // Non-blocking
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// migrate command
+// ---------------------------------------------------------------------------
+
+program
+  .command("migrate")
+  .description("Migrate old graph node types (preferences, lessons, patterns) to belief_node")
+  .action(async () => {
+    const state = await openDatabase();
+
+    try {
+      const { migrateAllToBeliefs } = await import("./graph.js");
+      const result = await migrateAllToBeliefs(state.db);
+
+      console.log("Migration complete:");
+      console.log(`  Preferences → beliefs: ${result.preferences}`);
+      console.log(`  Lessons → beliefs:     ${result.lessons}`);
+      console.log(`  Patterns → beliefs:    ${result.patterns}`);
+      console.log(`  Total beliefs created: ${result.preferences + result.lessons + result.patterns}`);
+    } finally {
+      closeDatabase(state);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // graph-status command
 // ---------------------------------------------------------------------------
 
@@ -545,6 +886,7 @@ program
       console.log(`  Patterns:  ${stats.nodes.patterns}`);
       console.log(`  Libraries: ${stats.nodes.libraries}`);
       console.log(`  Sessions:  ${stats.nodes.sessions}`);
+      console.log(`  Beliefs:   ${stats.nodes.beliefs}`);
       console.log("");
       console.log("Graph Edge Counts:");
       console.log(`  encountered:     ${stats.edges.encountered}`);

@@ -1,10 +1,13 @@
 /**
  * graph.ts — Graph database layer for entity/relationship tracking using CozoDB.
  *
- * Tracks errors, solutions, patterns, libraries, sessions, and users as graph
- * nodes, with edges representing relationships (encountered, solved_by, etc.).
- * Enables the orchestrator to navigate past solutions, user preferences, and
- * causal chains with precision.
+ * The primary schema is `belief_node` — a unified belief triplet that stores
+ * developer preferences, workflow patterns, coding conventions, and lessons as
+ * (subject, predicate, object) triples with confidence and provenance tracking.
+ *
+ * Workflow beliefs (`predicate: "workflow"`) replace the static orchestrator.md.
+ * Preference beliefs replace preference_node. The old node types (error_node,
+ * solution_node, etc.) are kept temporarily for backward compatibility.
  *
  * The graph layer complements vector search on the chunks table: vector search
  * finds relevant content by meaning, while the graph navigates structured
@@ -94,6 +97,46 @@ export interface GraphEntities {
   relationships: RelationshipEntity[];
 }
 
+// ---------------------------------------------------------------------------
+// Belief node — unified belief triplet (new primary schema)
+// ---------------------------------------------------------------------------
+
+export interface BeliefNode {
+  id: string;               // hash of subject:predicate:object:context
+  subject: string;           // "developer", "project:agent-orchestrator"
+  predicate: string;         // "prefers", "avoids", "uses", "workflow", "believes"
+  object: string;            // "named exports", "get approval before commit"
+  confidence: number;        // 0.0-1.0
+  strength: "strong" | "moderate" | "mild";
+  first_observed: number;    // timestamp
+  last_confirmed: number;    // timestamp
+  times_confirmed: number;
+  contradicted: boolean;
+  superseded_by: string | null;  // id of newer belief if contradicted
+  context: string | null;    // "typescript projects", "auth code"
+  project_scope: string | null;  // null = global
+  provenance: string;        // JSON array of conversation file refs
+}
+
+export type BeliefPredicate =
+  | "prefers"
+  | "avoids"
+  | "uses"
+  | "workflow"
+  | "believes"
+  | "dislikes"
+  | "pattern";
+
+export interface ExtractedBelief {
+  subject: string;
+  predicate: BeliefPredicate;
+  object: string;
+  confidence: number;
+  strength: "strong" | "moderate" | "mild";
+  context?: string;
+  project_scope?: string;
+}
+
 export interface SessionExtraction {
   sessionId: string;
   userId: string;
@@ -179,6 +222,7 @@ export interface GraphStats {
     patterns: number;
     libraries: number;
     sessions: number;
+    beliefs: number;
   };
   edges: {
     encountered: number;
@@ -530,6 +574,60 @@ export async function initGraphSchema(db: CozoDb): Promise<void> {
         tokenizer: Simple,
         filters: [Lowercase, Stemmer('english')]
       }`,
+    );
+  }
+
+  // --- belief_node: unified belief triplet (new primary schema) ---
+
+  if (!names.has("belief_node")) {
+    await runQuery(
+      db,
+      `:create belief_node {
+        id: String
+        =>
+        subject: String,
+        predicate: String,
+        object: String,
+        confidence: Float,
+        strength: String,
+        first_observed: Int,
+        last_confirmed: Int,
+        times_confirmed: Int,
+        contradicted: Bool,
+        superseded_by: String?,
+        context: String?,
+        project_scope: String?,
+        provenance: String
+      }`,
+    );
+  }
+
+  // FTS index on belief object field (the "what")
+  const beliefIndices = await existingIndices(db, "belief_node");
+  if (!beliefIndices.has("fts_object")) {
+    await runQuery(
+      db,
+      `::fts create belief_node:fts_object {
+        extractor: object,
+        tokenizer: Simple,
+        filters: [Lowercase, Stemmer('english')]
+      }`,
+    );
+  }
+
+  // Index for querying by predicate + project scope
+  if (!beliefIndices.has("idx_predicate")) {
+    await runQuery(
+      db,
+      "::index create belief_node:idx_predicate { predicate, project_scope, id }",
+    );
+  }
+
+  // Index for querying by subject
+  if (!beliefIndices.has("idx_subject")) {
+    await runQuery(
+      db,
+      "::index create belief_node:idx_subject { subject, id }",
     );
   }
 }
@@ -1198,6 +1296,629 @@ async function upsertRelationship(
 }
 
 // ---------------------------------------------------------------------------
+// Belief node operations
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a deterministic ID for a belief from its core triple + scope.
+ */
+function beliefId(
+  subject: string,
+  predicate: string,
+  object: string,
+  context?: string | null,
+  projectScope?: string | null,
+): string {
+  const parts = [subject, predicate, object];
+  if (context) parts.push(context);
+  if (projectScope) parts.push(projectScope);
+  return hashText(parts.join(":").toLowerCase().trim());
+}
+
+/**
+ * Upsert a belief into the belief_node relation.
+ * If the belief already exists, increments times_confirmed and updates
+ * last_confirmed. Confidence is updated to the max of existing and new.
+ */
+export async function upsertBelief(
+  db: CozoDb,
+  belief: ExtractedBelief,
+  provenanceRef: string,
+  timestamp?: number,
+): Promise<string> {
+  const ts = timestamp ?? Date.now();
+  const id = beliefId(
+    belief.subject,
+    belief.predicate,
+    belief.object,
+    belief.context,
+    belief.project_scope,
+  );
+
+  const existing = await runQuery(
+    db,
+    `?[confidence, times_confirmed, first_observed, provenance, contradicted] :=
+      *belief_node{ id: $id, confidence, times_confirmed, first_observed, provenance, contradicted }`,
+    { id },
+  );
+
+  let confidence: number;
+  let timesConfirmed: number;
+  let firstObserved: number;
+  let provenance: string;
+  let contradicted: boolean;
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0] as [number, number, number, string, boolean];
+    confidence = Math.max(row[0], belief.confidence);
+    timesConfirmed = row[1] + 1;
+    firstObserved = row[2];
+    contradicted = row[4];
+
+    // Append provenance ref if not already present
+    try {
+      const refs: string[] = JSON.parse(row[3]);
+      if (!refs.includes(provenanceRef)) {
+        refs.push(provenanceRef);
+      }
+      provenance = JSON.stringify(refs);
+    } catch {
+      provenance = JSON.stringify([provenanceRef]);
+    }
+  } else {
+    confidence = belief.confidence;
+    timesConfirmed = 1;
+    firstObserved = ts;
+    provenance = JSON.stringify([provenanceRef]);
+    contradicted = false;
+  }
+
+  await runQuery(
+    db,
+    `?[id, subject, predicate, object, confidence, strength, first_observed,
+      last_confirmed, times_confirmed, contradicted, superseded_by,
+      context, project_scope, provenance] <- [[
+      $id, $subject, $predicate, $object, $confidence, $strength, $first,
+      $last, $times, $contradicted, null,
+      $context, $project, $provenance
+    ]]
+    :put belief_node {
+      id => subject, predicate, object, confidence, strength,
+      first_observed, last_confirmed, times_confirmed,
+      contradicted, superseded_by, context, project_scope, provenance
+    }`,
+    {
+      id,
+      subject: belief.subject,
+      predicate: belief.predicate,
+      object: belief.object,
+      confidence,
+      strength: belief.strength,
+      first: firstObserved,
+      last: ts,
+      times: timesConfirmed,
+      contradicted,
+      context: belief.context ?? null,
+      project: belief.project_scope ?? null,
+      provenance,
+    },
+  );
+
+  return id;
+}
+
+/**
+ * Mark a belief as contradicted, optionally pointing to a superseding belief.
+ */
+export async function contradictBelief(
+  db: CozoDb,
+  id: string,
+  supersededById?: string,
+): Promise<void> {
+  await runQuery(
+    db,
+    `?[id, contradicted, superseded_by] <- [[$id, true, $super]]
+    :update belief_node { id => contradicted, superseded_by }`,
+    { id, super: supersededById ?? null },
+  );
+}
+
+/**
+ * Query beliefs by predicate and optional project scope.
+ * Returns beliefs ordered by confidence * recency.
+ * Non-contradicted beliefs only.
+ */
+export async function queryBeliefs(
+  db: CozoDb,
+  options: {
+    predicate?: string;
+    projectScope?: string | null;  // null = include global only, undefined = include all
+    subject?: string;
+    includeContradicted?: boolean;
+    limit?: number;
+  } = {},
+): Promise<BeliefNode[]> {
+  const limit = options.limit ?? 50;
+  const includeContradicted = options.includeContradicted ?? false;
+
+  // Build dynamic filter conditions
+  let filterClause = "";
+  const params: Record<string, unknown> = { limit };
+
+  if (options.predicate) {
+    filterClause += ", predicate = $predicate";
+    params.predicate = options.predicate;
+  }
+
+  if (options.subject) {
+    filterClause += ", subject = $subject";
+    params.subject = options.subject;
+  }
+
+  if (!includeContradicted) {
+    filterClause += ", contradicted = false";
+  }
+
+  // For project scope, we want: global beliefs + project-specific beliefs
+  let query: string;
+  if (options.projectScope !== undefined) {
+    if (options.projectScope === null) {
+      // Global only
+      filterClause += ", project_scope = null";
+      query = `?[id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance] :=
+        *belief_node{
+          id, subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed, contradicted,
+          superseded_by, context, project_scope, provenance
+        }${filterClause}
+      :order -confidence, -last_confirmed
+      :limit $limit`;
+    } else {
+      // Global + project-scoped
+      params.project = options.projectScope;
+
+      // Query for global beliefs
+      const globalFilter = filterClause + ", project_scope = null";
+      // Query for project beliefs
+      const projectFilter = filterClause + ", project_scope = $project";
+
+      query = `
+      global[id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance] :=
+        *belief_node{
+          id, subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed, contradicted,
+          superseded_by, context, project_scope, provenance
+        }${globalFilter}
+
+      project[id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance] :=
+        *belief_node{
+          id, subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed, contradicted,
+          superseded_by, context, project_scope, provenance
+        }${projectFilter}
+
+      ?[id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance] :=
+        global[id, subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed, contradicted,
+          superseded_by, context, project_scope, provenance]
+
+      ?[id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance] :=
+        project[id, subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed, contradicted,
+          superseded_by, context, project_scope, provenance]
+
+      :order -confidence, -last_confirmed
+      :limit $limit`;
+    }
+  } else {
+    // No project filter, return all
+    query = `?[id, subject, predicate, object, confidence, strength,
+      first_observed, last_confirmed, times_confirmed, contradicted,
+      superseded_by, context, project_scope, provenance] :=
+      *belief_node{
+        id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance
+      }${filterClause}
+    :order -confidence, -last_confirmed
+    :limit $limit`;
+  }
+
+  const result = await runQuery(db, query, params);
+
+  return result.rows.map((row) => ({
+    id: row[0] as string,
+    subject: row[1] as string,
+    predicate: row[2] as string,
+    object: row[3] as string,
+    confidence: row[4] as number,
+    strength: row[5] as "strong" | "moderate" | "mild",
+    first_observed: row[6] as number,
+    last_confirmed: row[7] as number,
+    times_confirmed: row[8] as number,
+    contradicted: row[9] as boolean,
+    superseded_by: row[10] as string | null,
+    context: row[11] as string | null,
+    project_scope: row[12] as string | null,
+    provenance: row[13] as string,
+  }));
+}
+
+/**
+ * Query workflow beliefs for a given project (global + project-scoped).
+ */
+export async function queryWorkflowBeliefs(
+  db: CozoDb,
+  projectScope?: string,
+): Promise<BeliefNode[]> {
+  return queryBeliefs(db, {
+    predicate: "workflow",
+    projectScope: projectScope ?? undefined,
+    subject: "developer",
+  });
+}
+
+/**
+ * Query preference beliefs for a given project (global + project-scoped).
+ */
+export async function queryPreferenceBeliefs(
+  db: CozoDb,
+  projectScope?: string,
+): Promise<BeliefNode[]> {
+  return queryBeliefs(db, {
+    predicate: "prefers",
+    projectScope: projectScope ?? undefined,
+    subject: "developer",
+  });
+}
+
+/**
+ * Full-text search on belief objects.
+ */
+export async function searchBeliefs(
+  db: CozoDb,
+  query: string,
+  limit = 10,
+): Promise<Array<BeliefNode & { score: number }>> {
+  const result = await runQuery(
+    db,
+    `
+    ?[score, id, subject, predicate, object, confidence, strength,
+      first_observed, last_confirmed, times_confirmed, contradicted,
+      superseded_by, context, project_scope, provenance] :=
+      ~belief_node:fts_object{ id |
+        query: $query,
+        k: $limit,
+        score_kind: 'tf_idf',
+        bind_score: score
+      },
+      *belief_node{
+        id, subject, predicate, object, confidence, strength,
+        first_observed, last_confirmed, times_confirmed, contradicted,
+        superseded_by, context, project_scope, provenance
+      },
+      contradicted = false
+
+    :order -score
+    `,
+    { query, limit },
+  );
+
+  return result.rows.map((row) => ({
+    score: row[0] as number,
+    id: row[1] as string,
+    subject: row[2] as string,
+    predicate: row[3] as string,
+    object: row[4] as string,
+    confidence: row[5] as number,
+    strength: row[6] as "strong" | "moderate" | "mild",
+    first_observed: row[7] as number,
+    last_confirmed: row[8] as number,
+    times_confirmed: row[9] as number,
+    contradicted: row[10] as boolean,
+    superseded_by: row[11] as string | null,
+    context: row[12] as string | null,
+    project_scope: row[13] as string | null,
+    provenance: row[14] as string,
+  }));
+}
+
+/**
+ * Get counts of beliefs by predicate.
+ */
+export async function getBeliefStats(
+  db: CozoDb,
+): Promise<{ predicate: string; count: number }[]> {
+  try {
+    const result = await runQuery(
+      db,
+      `?[predicate, count(id)] :=
+        *belief_node{ id, predicate, contradicted },
+        contradicted = false`,
+    );
+    return result.rows.map((row) => ({
+      predicate: row[0] as string,
+      count: row[1] as number,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Migration: convert old node types to belief_node
+// ---------------------------------------------------------------------------
+
+/**
+ * Migrate existing preference_node entries to belief_node.
+ * Each preference becomes a belief with predicate "prefers".
+ */
+export async function migratePreferencesToBeliefs(
+  db: CozoDb,
+): Promise<number> {
+  let migrated = 0;
+  try {
+    const result = await runQuery(
+      db,
+      `?[id, name, description, scope, project_id, strength, times_confirmed, first_learned, last_confirmed] :=
+        *preference_node{ id, name, description, scope, project_id, strength, times_confirmed, first_learned, last_confirmed }`,
+    );
+
+    for (const row of result.rows) {
+      const name = row[1] as string;
+      const description = row[2] as string | null;
+      const scope = row[3] as string;
+      const projectId = row[4] as string | null;
+      const strength = row[5] as number;
+      const timesConfirmed = row[6] as number;
+      const firstLearned = row[7] as number;
+      const lastConfirmed = row[8] as number;
+
+      // Resolve project name from project_id
+      let projectName: string | null = null;
+      if (projectId) {
+        try {
+          const projResult = await runQuery(
+            db,
+            "?[name] := *project_node{ id: $id, name }",
+            { id: projectId },
+          );
+          if (projResult.rows.length > 0) {
+            projectName = projResult.rows[0][0] as string;
+          }
+        } catch {
+          // project not found
+        }
+      }
+
+      const beliefObject = description ? `${name}: ${description}` : name;
+      const strengthLabel: "strong" | "moderate" | "mild" =
+        strength >= 0.8 ? "strong" : strength >= 0.5 ? "moderate" : "mild";
+
+      const id = beliefId(
+        "developer",
+        "prefers",
+        beliefObject,
+        null,
+        scope === "project" ? projectName : null,
+      );
+
+      await runQuery(
+        db,
+        `?[id, subject, predicate, object, confidence, strength, first_observed,
+          last_confirmed, times_confirmed, contradicted, superseded_by,
+          context, project_scope, provenance] <- [[
+          $id, 'developer', 'prefers', $object, $confidence, $strength, $first,
+          $last, $times, false, null,
+          null, $project, '["migrated"]'
+        ]]
+        :put belief_node {
+          id => subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed,
+          contradicted, superseded_by, context, project_scope, provenance
+        }`,
+        {
+          id,
+          object: beliefObject,
+          confidence: strength,
+          strength: strengthLabel,
+          first: firstLearned,
+          last: lastConfirmed,
+          times: timesConfirmed,
+          project: scope === "project" ? projectName : null,
+        },
+      );
+
+      migrated++;
+    }
+  } catch {
+    // preference_node may not exist
+  }
+
+  return migrated;
+}
+
+/**
+ * Migrate existing lesson_node entries to belief_node.
+ * Each lesson becomes a belief with predicate "believes".
+ */
+export async function migrateLessonsToBeliefs(
+  db: CozoDb,
+): Promise<number> {
+  let migrated = 0;
+  try {
+    const result = await runQuery(
+      db,
+      `?[id, name, description, project_id, times_relevant, first_learned, last_referenced] :=
+        *lesson_node{ id, name, description, project_id, times_relevant, first_learned, last_referenced }`,
+    );
+
+    for (const row of result.rows) {
+      const name = row[1] as string;
+      const description = row[2] as string | null;
+      const projectId = row[3] as string | null;
+      const timesRelevant = row[4] as number;
+      const firstLearned = row[5] as number;
+      const lastReferenced = row[6] as number;
+
+      // Resolve project name
+      let projectName: string | null = null;
+      if (projectId) {
+        try {
+          const projResult = await runQuery(
+            db,
+            "?[name] := *project_node{ id: $id, name }",
+            { id: projectId },
+          );
+          if (projResult.rows.length > 0) {
+            projectName = projResult.rows[0][0] as string;
+          }
+        } catch {
+          // project not found
+        }
+      }
+
+      const beliefObject = description ? `${name}: ${description}` : name;
+      const confidence = Math.min(1.0, 0.5 + timesRelevant * 0.1);
+      const strengthLabel: "strong" | "moderate" | "mild" =
+        confidence >= 0.8 ? "strong" : confidence >= 0.5 ? "moderate" : "mild";
+
+      const id = beliefId(
+        "developer",
+        "believes",
+        beliefObject,
+        null,
+        projectName,
+      );
+
+      await runQuery(
+        db,
+        `?[id, subject, predicate, object, confidence, strength, first_observed,
+          last_confirmed, times_confirmed, contradicted, superseded_by,
+          context, project_scope, provenance] <- [[
+          $id, 'developer', 'believes', $object, $confidence, $strength, $first,
+          $last, $times, false, null,
+          null, $project, '["migrated"]'
+        ]]
+        :put belief_node {
+          id => subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed,
+          contradicted, superseded_by, context, project_scope, provenance
+        }`,
+        {
+          id,
+          object: beliefObject,
+          confidence,
+          strength: strengthLabel,
+          first: firstLearned,
+          last: lastReferenced,
+          times: timesRelevant,
+          project: projectName,
+        },
+      );
+
+      migrated++;
+    }
+  } catch {
+    // lesson_node may not exist
+  }
+
+  return migrated;
+}
+
+/**
+ * Migrate existing pattern_node entries to belief_node.
+ * Successful patterns become workflow beliefs.
+ */
+export async function migratePatternsToBeliefs(
+  db: CozoDb,
+): Promise<number> {
+  let migrated = 0;
+  try {
+    const result = await runQuery(
+      db,
+      `?[id, name, description, category, times_applied, times_successful, success_rate, first_applied, last_applied] :=
+        *pattern_node{ id, name, description, category, times_applied, times_successful, success_rate, first_applied, last_applied }`,
+    );
+
+    for (const row of result.rows) {
+      const name = row[1] as string;
+      const description = row[2] as string | null;
+      const timesApplied = row[4] as number;
+      const successRate = row[6] as number;
+      const firstApplied = row[7] as number;
+      const lastApplied = row[8] as number;
+
+      const beliefObject = description ? `${name}: ${description}` : name;
+      const confidence = successRate;
+      const strengthLabel: "strong" | "moderate" | "mild" =
+        confidence >= 0.8 ? "strong" : confidence >= 0.5 ? "moderate" : "mild";
+
+      const id = beliefId(
+        "developer",
+        "pattern",
+        beliefObject,
+        null,
+        null,
+      );
+
+      await runQuery(
+        db,
+        `?[id, subject, predicate, object, confidence, strength, first_observed,
+          last_confirmed, times_confirmed, contradicted, superseded_by,
+          context, project_scope, provenance] <- [[
+          $id, 'developer', 'pattern', $object, $confidence, $strength, $first,
+          $last, $times, false, null,
+          null, null, '["migrated"]'
+        ]]
+        :put belief_node {
+          id => subject, predicate, object, confidence, strength,
+          first_observed, last_confirmed, times_confirmed,
+          contradicted, superseded_by, context, project_scope, provenance
+        }`,
+        {
+          id,
+          object: beliefObject,
+          confidence,
+          strength: strengthLabel,
+          first: firstApplied,
+          last: lastApplied,
+          times: timesApplied,
+        },
+      );
+
+      migrated++;
+    }
+  } catch {
+    // pattern_node may not exist
+  }
+
+  return migrated;
+}
+
+/**
+ * Run all migrations from old node types to belief_node.
+ */
+export async function migrateAllToBeliefs(
+  db: CozoDb,
+): Promise<{ preferences: number; lessons: number; patterns: number }> {
+  const preferences = await migratePreferencesToBeliefs(db);
+  const lessons = await migrateLessonsToBeliefs(db);
+  const patterns = await migratePatternsToBeliefs(db);
+  return { preferences, lessons, patterns };
+}
+
+// ---------------------------------------------------------------------------
 // Main graph update function
 // ---------------------------------------------------------------------------
 
@@ -1543,7 +2264,7 @@ export async function searchSolutions(
  */
 export async function getGraphStats(db: CozoDb): Promise<GraphStats> {
   const stats: GraphStats = {
-    nodes: { users: 0, errors: 0, solutions: 0, patterns: 0, libraries: 0, sessions: 0 },
+    nodes: { users: 0, errors: 0, solutions: 0, patterns: 0, libraries: 0, sessions: 0, beliefs: 0 },
     edges: {
       encountered: 0, solved_by: 0, uses_lib: 0, applies_pattern: 0,
       prefers: 0, avoids: 0, conflicts_with: 0, similar_to: 0, caused_by: 0,
@@ -1558,6 +2279,7 @@ export async function getGraphStats(db: CozoDb): Promise<GraphStats> {
     ["patterns", "pattern_node"],
     ["libraries", "library_node"],
     ["sessions", "session_node"],
+    ["beliefs", "belief_node"],
   ];
 
   for (const [key, table] of nodeTables) {
@@ -1823,6 +2545,8 @@ export interface RecallContext {
   projectLessons: ProjectLesson[];
   recentErrors: UserError[];
   recentSolutions: Array<{ errorName: string; solutionName: string; successRate: number }>;
+  workflowBeliefs: BeliefNode[];
+  preferenceBeliefs: BeliefNode[];
 }
 
 export async function getRecallContext(
@@ -1865,6 +2589,10 @@ export async function getRecallContext(
     }
   }
 
+  // Get belief-based data
+  const workflowBeliefs = await queryWorkflowBeliefs(db, projectName);
+  const preferenceBeliefs = await queryPreferenceBeliefs(db, projectName);
+
   return {
     project,
     globalPreferences,
@@ -1873,6 +2601,8 @@ export async function getRecallContext(
     projectLessons,
     recentErrors: recentErrors.slice(0, 10),
     recentSolutions,
+    workflowBeliefs,
+    preferenceBeliefs,
   };
 }
 
@@ -1925,6 +2655,26 @@ export function formatRecallContext(context: RecallContext): string {
     lines.push("## Known Solutions");
     for (const sol of context.recentSolutions.slice(0, 10)) {
       lines.push(`- ${sol.errorName} → ${sol.solutionName} (${Math.round(sol.successRate * 100)}% success)`);
+    }
+    lines.push("");
+  }
+
+  if (context.workflowBeliefs.length > 0) {
+    lines.push("## Workflow Beliefs");
+    for (const belief of context.workflowBeliefs) {
+      const scope = belief.project_scope ? ` [${belief.project_scope}]` : "";
+      const conf = Math.round(belief.confidence * 100);
+      lines.push(`- ${belief.object}${scope} (${conf}% confidence, ${belief.strength})`);
+    }
+    lines.push("");
+  }
+
+  if (context.preferenceBeliefs.length > 0) {
+    lines.push("## Preference Beliefs");
+    for (const belief of context.preferenceBeliefs) {
+      const scope = belief.project_scope ? ` [${belief.project_scope}]` : "";
+      const conf = Math.round(belief.confidence * 100);
+      lines.push(`- ${belief.object}${scope} (${conf}% confidence, ${belief.strength})`);
     }
     lines.push("");
   }
